@@ -833,6 +833,10 @@ def angle(x: torch.Tensor) -> torch.Tensor:
     )
     pi = torch.scalar_tensor(math.pi, dtype=dtype, device=x.device)
     ret = torch.where(x < 0, pi, 0.0)
+    if config.numerics == "strict":
+        # Eager returns the input NaN unchanged, payload and sign bit included; the
+        # literal below is a canonical quiet NaN.
+        return torch.where(torch.isnan(x), x.to(dtype), ret)
     return torch.where(torch.isnan(x), float("nan"), ret)
 
 
