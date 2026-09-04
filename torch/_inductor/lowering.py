@@ -8687,8 +8687,120 @@ logical_xor = register_pointwise(
 )
 maximum = register_pointwise(aten.maximum)
 minimum = register_pointwise(aten.minimum)
-register_lowering(aten.clamp_min)(maximum)
-register_lowering(aten.clamp_max)(minimum)
+
+
+# Integer masks for the strict-clamp NaN guard (below), keyed by float dtype.
+# A float is NaN iff its sign-masked bits exceed the infinity bit-pattern.
+_STRICT_NAN_BITS = {
+    torch.float32: (torch.int32, 0x7FFFFFFF, 0x7F800000),
+    torch.float64: (torch.int64, 0x7FFFFFFFFFFFFFFF, 0x7FF0000000000000),
+}
+
+
+def _strict_isnan(v, dtype):
+    # NaN guard that survives codegen: ptxas fuses bare float setp+selp
+    # clamp idioms into FMNMX.NAN, which canonicalizes NaN payloads (and LLVM
+    # can drop `x != x` guards when it rewrites the nest into min/max form).
+    # An integer-domain guard is opaque to both: no float idiom matches it,
+    # and any fusion of integer selects stays bit-exact. fp16/bf16 keep the
+    # plain check; their regions narrow to b16 selects, which ptxas leaves
+    # alone.
+    if dtype not in _STRICT_NAN_BITS:
+        return ops.ne(v, v)
+    int_dtype, sign_mask, inf_bits = _STRICT_NAN_BITS[dtype]
+    bits = ops.to_dtype_bitcast(v, int_dtype, src_dtype=dtype)
+    masked = ops.bitwise_and(bits, ops.constant(sign_mask, int_dtype))
+    return ops.gt(masked, ops.constant(inf_bits, int_dtype))
+
+
+def _strict_clamp_link(a, b, dtype, *, is_min):
+    # Eager uses two different kernels: tensor bounds go through IEEE
+    # maximum/minimum (the +-0.0 tie resolves to +0.0/-0.0), while scalar
+    # bounds are comparison-based (the first operand wins ties and NaN).
+    # Match each: tensor bounds keep the existing lowering, scalar bounds
+    # use the first-wins form below.
+    if isinstance(b, (TensorBox, ExpandView)):
+        return maximum(a, b) if is_min else minimum(a, b)
+    b = _strict_clamp_bound(b, a, dtype)
+    if is_min:
+
+        def inner(x, lo):
+            return ops.where(
+                _strict_isnan(x, dtype),
+                x,
+                ops.where(
+                    _strict_isnan(lo, dtype),
+                    lo,
+                    ops.where(ops.ge(x, lo), x, lo),
+                ),
+            )
+
+    else:
+
+        def inner(x, hi):
+            return ops.where(
+                _strict_isnan(x, dtype),
+                x,
+                ops.where(
+                    _strict_isnan(hi, dtype),
+                    hi,
+                    ops.where(ops.le(x, hi), x, hi),
+                ),
+            )
+
+    return make_pointwise(inner)(a, b)
+
+
+def _strict_clamp_bound(b, a, dtype):
+    # Lift a scalar bound to a 0-d constant tensor so codegen loads it (like
+    # a tensor bound) instead of emitting an fp32 tl.full: the fp32 full
+    # would anchor the fused clamp region in fp32, where cvt.f32.f16 /
+    # cvt.f32.bf16 canonicalizes NaN payloads before the selects run. With
+    # every operand a narrow load, Triton narrows the whole region to the
+    # input width and the selects preserve payloads bitwise. Only fp16/bf16
+    # need this; wider dtypes never upcast on load.
+    if dtype not in (torch.float16, torch.bfloat16):
+        return b
+    if (
+        isinstance(b, ir.Constant)
+        and b.dtype.is_floating_point
+        and isinstance(b.value, (int, float))
+    ):
+        b = b.value
+    if not isinstance(b, (int, float)) or isinstance(b, bool):
+        return b
+    if not isinstance(a, (TensorBox, ExpandView)):
+        return b
+    with torch.utils._python_dispatch._disable_current_modes():
+        data = torch.tensor(b, dtype=dtype, device=a.get_device_or_error())
+    return expand(V.graph.add_tensor_constant(data), list(a.get_size()))
+
+
+def _clamp_computation_dtype(args):
+    for x in args:
+        if isinstance(x, (TensorBox, ExpandView)):
+            return x.get_dtype()
+    return None
+
+
+@register_lowering(aten.clamp_min, broadcast=True)
+def clamp_min(a, b):
+    if config.numerics == "strict":
+        dtype = _clamp_computation_dtype((a, b))
+        if dtype is not None and dtype.is_floating_point:
+            return _strict_clamp_link(a, b, dtype, is_min=True)
+    return maximum(a, b)
+
+
+@register_lowering(aten.clamp_max, broadcast=True)
+def clamp_max(a, b):
+    if config.numerics == "strict":
+        dtype = _clamp_computation_dtype((a, b))
+        if dtype is not None and dtype.is_floating_point:
+            return _strict_clamp_link(a, b, dtype, is_min=False)
+    return minimum(a, b)
+
+
 # aten.fmax/fmin reach here only under numerics="strict" (select_decomp_table
 # keeps their decomposition otherwise); the name also registers prims.fmax/fmin.
 fmax = register_pointwise(aten.fmax)
