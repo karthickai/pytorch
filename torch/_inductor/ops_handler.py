@@ -371,6 +371,14 @@ class OpsHandler(Generic[T]):
     def fmaximum(self, x0: T, x1: T) -> T:
         raise NotImplementedError
 
+    def fmax(self, x0: T, x1: T) -> T:
+        """IEEE maxNum: NaN is ignored unless both operands are NaN."""
+        raise NotImplementedError
+
+    def fmin(self, x0: T, x1: T) -> T:
+        """IEEE minNum: NaN is ignored unless both operands are NaN."""
+        raise NotImplementedError
+
     def cos(self, x0: T) -> T:
         raise NotImplementedError
 

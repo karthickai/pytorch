@@ -8689,6 +8689,10 @@ maximum = register_pointwise(aten.maximum)
 minimum = register_pointwise(aten.minimum)
 register_lowering(aten.clamp_min)(maximum)
 register_lowering(aten.clamp_max)(minimum)
+# aten.fmax/fmin reach here only under numerics="strict" (select_decomp_table
+# keeps their decomposition otherwise); the name also registers prims.fmax/fmin.
+fmax = register_pointwise(aten.fmax)
+fmin = register_pointwise(aten.fmin)
 register_op_dtype_propagation_rules(
     "fmaximum",
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,

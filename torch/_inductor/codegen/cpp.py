@@ -645,7 +645,7 @@ def arith_promoted(op, a, b):
 
 
 class CppOverrides(OpOverrides):
-    """Map element-wise ops to C++"""
+    """Map element-wise ops to their C++ (scalar, non-vectorized) source form."""
 
     @staticmethod
     def add(a, b):
@@ -1018,6 +1018,24 @@ class CppOverrides(OpOverrides):
     # pyrefly: ignore [bad-override]
     def fmaximum(a, b):
         return f"std::max({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmax(a, b):
+        # Match eager CPU: float fmax is std::fmax (NaN-suppressing), while
+        # integer/bool fmax lowers to maximum. Reached only when the aten
+        # decomposition is skipped under numerics="strict".
+        if getattr(a, "dtype", None) is not None and a.dtype.is_floating_point:
+            return f"std::fmax({a}, {b})"
+        return f"std::max({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmin(a, b):
+        # See fmax: float fmin is std::fmin, integer/bool fmin is minimum.
+        if getattr(a, "dtype", None) is not None and a.dtype.is_floating_point:
+            return f"std::fmin({a}, {b})"
+        return f"std::min({a}, {b})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]

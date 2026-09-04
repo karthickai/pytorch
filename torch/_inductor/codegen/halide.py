@@ -345,6 +345,25 @@ class HalideOverrides(OpOverrides):
 
     @staticmethod
     # pyrefly: ignore [bad-override]
+    def fmax(a, b):
+        # Preserve the old decomposed where/isnan form; only the Triton
+        # override is eager-exact under strict numerics.
+        if not hasattr(a, "name"):
+            return f"hl.max({a}, {b})"
+        b = f"hl.cast({a.name}.type(), {b})"
+        return f"hl.select(hl.is_nan({b})|({b}<{a}), {a}, {b}) if {a.name}.type().is_float() else hl.max({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmin(a, b):
+        # See fmax.
+        if not hasattr(a, "name"):
+            return f"hl.min({a}, {b})"
+        b = f"hl.cast({a.name}.type(), {b})"
+        return f"hl.select(hl.is_nan({b})|({b}>{a}), {a}, {b}) if {a.name}.type().is_float() else hl.min({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
     def where(a, b, c):
         if hasattr(b, "name"):
             c = f"hl.cast({b.name}.type(), {c})"
