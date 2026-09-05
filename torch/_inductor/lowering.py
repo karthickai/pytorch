@@ -7749,11 +7749,73 @@ def _div_rn(a, b):
     return ops.div_rn(a, b)
 
 
+# Eager-NaN bit patterns (all exponent+mantissa bits set, sign clear) keyed
+# by float dtype: eager yields these where the compiled path would produce
+# an injected canonical NaN or a preserved payload.
+_STRICT_EAGER_NAN_BITS = {
+    torch.float32: (torch.int32, 0x7FFFFFFF),
+    torch.float64: (torch.int64, 0x7FFFFFFFFFFFFFFF),
+    torch.float16: (torch.int16, 0x7FFF),
+    torch.bfloat16: (torch.int16, 0x7FFF),
+}
+
+
+def _strict_floor_div_floating(a, b, ref):
+    # Port of c10::div_floor_floating, which eager CUDA uses for
+    # tensor-tensor float floor division: fmod-based exact quotient (immune
+    # to quotient rounding), general sign correction, floor with a 0.5
+    # correction, and signed zero via copysign. NaN outputs use eager's
+    # all-bits-set convention; the b == 0 arm returns a / b directly.
+    dtype = ref.get_dtype()
+    int_dtype, nan_bits = _STRICT_EAGER_NAN_BITS[dtype]
+    zero = constant_like(0.0)(ref)
+    one = constant_like(1.0)(ref)
+    half = constant_like(0.5)(ref)
+    neg_zero = constant_like(-0.0)(ref)
+
+    def fn(a, b, zero, one, half, neg_zero):
+        nan = ops.to_dtype_bitcast(
+            ops.constant(nan_bits, int_dtype), dtype, src_dtype=int_dtype
+        )
+        mod = ops.fmod(a, b)
+        quot = ops.div_rn(ops.sub(a, mod), b)
+        div = ops.where(
+            ops.logical_and(
+                ops.ne(mod, zero), ops.ne(ops.lt(b, zero), ops.lt(mod, zero))
+            ),
+            ops.sub(quot, one),
+            quot,
+        )
+        fl = ops.floor(div)
+        floordiv = ops.where(ops.gt(ops.sub(div, fl), half), ops.add(fl, one), fl)
+        result = ops.where(
+            ops.eq(div, zero),
+            ops.where(ops.signbit(ops.div_rn(a, b)), neg_zero, zero),
+            floordiv,
+        )
+        result = ops.where(ops.logical_or(ops.isnan(a), ops.isnan(b)), nan, result)
+        result = ops.where(ops.logical_and(ops.isinf(a), ops.ne(b, zero)), nan, result)
+        ab = ops.div_rn(a, b)
+        result = ops.where(ops.eq(b, zero), ab, result)
+        return ops.where(
+            ops.logical_and(
+                ops.eq(b, zero),
+                ops.logical_or(ops.isnan(a), ops.eq(a, zero)),
+            ),
+            nan,
+            result,
+        )
+
+    return make_pointwise(fn)(a, b, zero, one, half, neg_zero)
+
+
 def _floor_div_floating(a, b):
     # Either operand may be a python scalar (e.g. torch.floor_divide(scalar,
     # tensor)); constant_like needs a tensor for dtype/device/size, so seed the
     # constants from whichever operand is a tensor.
     ref = a if isinstance(a, (TensorBox, IRNode)) else b
+    if _strict_cuda_float_dtype((a, b)) is not None:
+        return _strict_floor_div_floating(a, b, ref)
     nan = constant_like(float("nan"))(ref)
     neg_one = constant_like(-1.0)(ref)
     zero = constant_like(0.0)(ref)
@@ -8828,6 +8890,23 @@ def _clamp_computation_dtype(args):
     return None
 
 
+def _strict_cuda_float_dtype(args):
+    # Computation dtype for strict-numerics overrides that mirror eager CUDA
+    # kernels: real floating point on CUDA, else None.
+    if config.numerics != "strict":
+        return None
+    dtype = _clamp_computation_dtype(args)
+    if dtype is None or not dtype.is_floating_point or dtype.is_complex:
+        return None
+    device = next(
+        (x.get_device() for x in args if isinstance(x, (TensorBox, ExpandView))),
+        None,
+    )
+    if device is None or device.type != "cuda":
+        return None
+    return dtype
+
+
 @register_lowering(aten.clamp_min, broadcast=True)
 def clamp_min(a, b):
     if config.numerics == "strict":
@@ -8869,6 +8948,23 @@ register_op_dtype_propagation_rules(
 @register_lowering(aten.remainder, broadcast=True)
 def remainder(a, b):
     a, b = promote_constants((a, b), round_scalar_constants=True)
+    if config.numerics == "strict":
+        dtype = _strict_cuda_float_dtype((a, b))
+        if dtype is not None:
+
+            def fn(a, b):
+                # Eager evaluates float remainder through correctly-rounded
+                # fmod (BinaryRemainderKernel.cu); Triton's % is a
+                # quotient-rounded expansion that loses precision and the
+                # zero sign, and propagates inf instead of NaN.
+                r = ops.fmod(a, b)
+                cond = ops.logical_and(
+                    ops.ne(r, ops.constant(0, torch.int32)),
+                    ops.ne(ops.signbit(r), ops.signbit(b)),
+                )
+                return ops.where(cond, ops.add(r, b), r)
+
+            return make_pointwise(fn)(a, b)
     fn = ops_wrapper("remainder")
     return make_pointwise(fn)(a, b)
 
