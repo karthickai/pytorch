@@ -7866,8 +7866,21 @@ def div_prim(a, b):
 
     # Disable CPU optimization to avoid precision issues.
     # see https://github.com/pytorch/pytorch/issues/157959
-    if (divisor := get_constant_value(b)) is not None and a.get_device().type != "cpu":
-        # Replace divide by constant with multiply by reciprocal
+    if (
+        (divisor := get_constant_value(b)) is not None
+        and a.get_device().type != "cpu"
+        and not (
+            config.numerics == "strict"
+            and a.get_dtype().is_floating_point
+            and not a.get_dtype().is_complex
+        )
+    ):
+        # Replace divide by constant with multiply by reciprocal.
+        # Skipped under strict numerics for real float: eager truly divides
+        # by constants in some ops (round_decimals, hardswish_backward) while
+        # multiplying by the reciprocal in others; those keep the rewrite via
+        # their own strict branches (hardswish/hardsigmoid forward overrides,
+        # div scalar pin below). Complex keeps the rewrite (separate scope).
 
         if divisor.value == 0:
             reciprocal = math.copysign(float("inf"), divisor.value)
@@ -7890,6 +7903,25 @@ register_pointwise_op("truediv")
     type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
 )
 def div(a, b):
+    a_device = a.get_device() if isinstance(a, (TensorBox, ExpandView)) else None
+    if (
+        config.numerics == "strict"
+        and isinstance(b, (int, float))
+        and not isinstance(b, bool)
+        and a_device is not None
+        and a_device.type != "cpu"
+        and a.get_dtype().is_floating_point
+        and not a.get_dtype().is_complex
+    ):
+        # Eager true-divide by a CPU scalar multiplies by the reciprocal
+        # (BinaryDivTrueKernel.cu); match it. Decomp-internal true divisions
+        # never take this branch: round_dec and hardswish_backward spell
+        # their divisors as 0-d tensors.
+        if b == 0:
+            reciprocal = math.copysign(float("inf"), b)
+        else:
+            reciprocal = 1.0 / b
+        return mul(a, reciprocal)
     a, b = promote_constants(
         (a, b), type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
     )

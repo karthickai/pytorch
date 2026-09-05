@@ -21,6 +21,9 @@ from torch._decomp.decompositions import (
     _grid_sampler_2d as decomp_grid_sampler_2d,
     _index_add,
     embedding_dense_backward as decomp_embedding_dense_backward,
+    hardsigmoid as decomp_hardsigmoid,
+    hardswish as decomp_hardswish,
+    hardswish_backward as decomp_hardswish_backward,
     pw_cast_for_opmath,
     pw_cast_for_opmath_non_tensor_args,
 )
@@ -149,6 +152,9 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.lerp,
     aten.lerp_,
     aten.special_log_ndtr,  # inductor re-registers with copysign wrapper (#187336)
+    aten.hardswish,  # inductor re-registers with strict reciprocal pin
+    aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
+    aten.hardswish_backward,  # inductor re-registers with strict true-division
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
@@ -490,8 +496,56 @@ def convolution_backward(
 
 @register_decomposition([aten.round.decimals])
 def round_dec(x: torch.Tensor, decimals: int = 0) -> torch.Tensor:
+    if config.numerics == "strict":
+        # Mirror eager CUDA (round_decimals_kernel_cuda): exact pow10 scale
+        # with correctly-rounded division. The divisor is a 0-d tensor so the
+        # aten.div lowering keeps a true division: under strict, div_prim no
+        # longer folds a constant divisor into a reciprocal multiply, while
+        # the div lowering keeps eager's reciprocal for user-level scalar
+        # division (BinaryDivTrueKernel.cu).
+        scale = 10.0 ** abs(decimals)
+        descale = torch.full((), scale, dtype=x.dtype, device=x.device)
+        if decimals < 0:
+            return aten.round(x / descale) * scale
+        return aten.round(x * scale) / descale
     ten_pow_decimals = 10.0**decimals
     return aten.round(x * ten_pow_decimals) * (1.0 / ten_pow_decimals)
+
+
+@register_decomposition([aten.hardswish])
+@pw_cast_for_opmath
+def hardswish(self: torch.Tensor) -> torch.Tensor:
+    if config.numerics == "strict":
+        # Eager forward multiplies by (1/6); keep the reciprocal form so the
+        # strict div_prim gate (true division for /const) doesn't change it.
+        return self * torch.clamp(torch.clamp(self + 3, min=0), max=6) * (1.0 / 6.0)
+    return decomp_hardswish(self)
+
+
+@register_decomposition([aten.hardsigmoid])
+@pw_cast_for_opmath
+def hardsigmoid(self: torch.Tensor) -> torch.Tensor:
+    if config.numerics == "strict":
+        # Same reciprocal convention as hardswish (one_sixth in both eager
+        # kernels); see hardswish above.
+        return torch.clamp(torch.clamp(self + 3, min=0), max=6) * (1.0 / 6.0)
+    return decomp_hardsigmoid(self)
+
+
+@register_decomposition([aten.hardswish_backward])
+@pw_cast_for_opmath
+def hardswish_backward(grad_output: torch.Tensor, self: torch.Tensor) -> torch.Tensor:
+    if config.numerics == "strict":
+        # Eager truly divides by 3; spell the divisor as a 0-d tensor so the
+        # aten.div lowering keeps a true division (a Python scalar would take
+        # the div lowering's eager-reciprocal pin).
+        three = torch.full((), 3, dtype=self.dtype, device=self.device)
+        return torch.where(
+            self <= -3,
+            0.0,
+            torch.where(self < 3, grad_output * ((self / three) + 0.5), grad_output),
+        )
+    return decomp_hardswish_backward(grad_output, self)
 
 
 @register_decomposition([aten.bmm])
