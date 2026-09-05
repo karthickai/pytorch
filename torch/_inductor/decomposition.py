@@ -513,7 +513,10 @@ def round_dec(x: torch.Tensor, decimals: int = 0) -> torch.Tensor:
         descale = torch.full((), scale, dtype=x.dtype, device=x.device)
         if decimals < 0:
             return aten.round(x / descale) * scale
-        return aten.round(x * scale) / descale
+        # Multiply by the 0-d narrow tensor (not the Python scalar) so the
+        # product lowers with narrow box operands and strict computes it in
+        # scalar_t like eager's kernel, instead of fp32.
+        return aten.round(x * descale) / descale
     ten_pow_decimals = 10.0**decimals
     return aten.round(x * ten_pow_decimals) * (1.0 / ten_pow_decimals)
 
