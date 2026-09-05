@@ -1783,6 +1783,27 @@ def frexp(x):
 
 
 @triton.jit
+def frexp_strict(x, eager_nan):
+    # Strict-numerics frexp: eager preserves the zero sign in the mantissa
+    # and yields all-bits-set NaN, where frexp above forces +0 and passes
+    # the input payload through. eager_nan carries the dtype's all-bits-set
+    # NaN so this helper needs no dtype dispatch.
+    zero = x == 0
+    is_inf = libdevice.isinf(x).to(tl.int1)
+    is_nan = libdevice.isnan(x).to(tl.int1)
+    special = zero | is_inf | is_nan
+    safe_x = tl.where(special, 1.0, x)
+    y = libdevice.ilogb(safe_x) + 1
+    exponent = tl.where(special, 0, y)
+    mantissa = tl.where(
+        zero,
+        x,
+        tl.where(is_nan, eager_nan, tl.where(is_inf, x, libdevice.ldexp(safe_x, -y))),
+    )
+    return mantissa, exponent
+
+
+@triton.jit
 def _compare_and_swap_with_index(
     x,
     idxs,

@@ -8749,7 +8749,6 @@ _foreach_addcdiv_scalar = register_foreach_pointwise(
 
 register_pointwise_numeric_ldf64(aten.cos)
 register_pointwise_numeric_ldf64(aten.sin)
-abs = register_pointwise(aten.abs)
 bitwise_and = register_pointwise(aten.bitwise_and)
 bitwise_left_shift = register_pointwise(aten.bitwise_left_shift)
 bitwise_not = register_pointwise(
@@ -8935,7 +8934,54 @@ register_op_dtype_propagation_rules(
     override_return_dtype=None,
 )
 neg = register_pointwise(aten.neg)
-abs = register_pointwise(aten.abs)
+_abs_pointwise = register_pointwise(aten.abs)
+
+
+# Integer-domain abs parameters keyed by float dtype: sign-clear mask,
+# infinity bits (NaN iff sign-masked bits exceed these), and eager's
+# all-bits-set NaN, with the same-width integer type.
+_STRICT_ABS_INT = {
+    torch.float32: (torch.int32, 0x7FFFFFFF, 0x7F800000, 0x7FFFFFFF),
+    torch.float64: (
+        torch.int64,
+        0x7FFFFFFFFFFFFFFF,
+        0x7FF0000000000000,
+        0x7FFFFFFFFFFFFFFF,
+    ),
+    torch.float16: (torch.int16, 0x7FFF, 0x7C00, 0x7FFF),
+    torch.bfloat16: (torch.int16, 0x7FFF, 0x7F80, 0x7FFF),
+}
+
+
+@register_lowering(aten.abs.default, broadcast=True)
+def abs(x):
+    dtype = _strict_cuda_float_dtype((x,))
+    if dtype is not None and dtype in _STRICT_ABS_INT:
+        int_dtype, sign_mask, inf_bits, nan_bits = _STRICT_ABS_INT[dtype]
+
+        def fn(x):
+            # Eager `abs` maps every NaN encoding to all-bits-set while
+            # fabs preserves the payload. Clear the sign bit in the integer
+            # domain (exact for all inputs) and inject the eager NaN for
+            # NaN inputs, using the integer-domain test on f32/f64 (opaque
+            # to float-idiom fusion) and the plain check on narrow dtypes.
+            bits = ops.to_dtype_bitcast(x, int_dtype, src_dtype=dtype)
+            if dtype in (torch.float16, torch.bfloat16):
+                is_nan = ops.ne(x, x)
+            else:
+                masked = ops.bitwise_and(bits, ops.constant(sign_mask, int_dtype))
+                is_nan = ops.gt(masked, ops.constant(inf_bits, int_dtype))
+            absbits = ops.bitwise_and(bits, ops.constant(sign_mask, int_dtype))
+            absval = ops.to_dtype_bitcast(absbits, dtype, src_dtype=int_dtype)
+            nan = ops.to_dtype_bitcast(
+                ops.constant(nan_bits, int_dtype), dtype, src_dtype=int_dtype
+            )
+            return ops.where(is_nan, nan, absval)
+
+        return make_pointwise(fn)(x)
+    return _abs_pointwise(x)
+
+
 reciprocal = register_pointwise_numeric(aten.reciprocal)
 
 register_op_dtype_propagation_rules(

@@ -712,9 +712,6 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 # message tags each mismatching call as nan-payload, signed-zero or value.
 POINTWISE_XFAIL = frozenset(
     {
-        ("abs", "bfloat16"),
-        ("abs", "float16"),
-        ("abs", "float32"),
         ("addcdiv", "bfloat16"),
         ("addcdiv", "float16"),
         ("addcdiv", "float32"),
@@ -729,9 +726,6 @@ POINTWISE_XFAIL = frozenset(
         ("float_power", "float16"),
         ("float_power", "float32"),
         ("floor_divide", "float16"),
-        ("frexp", "bfloat16"),
-        ("frexp", "float16"),
-        ("frexp", "float32"),
         ("ldexp", "bfloat16"),
         ("ldexp", "float16"),
         ("logaddexp2", "float32"),
@@ -788,9 +782,6 @@ BACKWARD_XFAIL = frozenset(
         ("ldexp", "float16"),
         ("ldexp", "float32"),
         ("logaddexp2", "float32"),
-        ("logit", "bfloat16"),
-        ("logit", "float16"),
-        ("logit", "float32"),
         ("mvlgamma_mvlgamma_p_1", "float32"),
         ("mvlgamma_mvlgamma_p_3", "float32"),
         ("mvlgamma_mvlgamma_p_5", "float32"),

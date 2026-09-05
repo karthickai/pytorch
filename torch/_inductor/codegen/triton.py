@@ -2072,6 +2072,19 @@ class TritonOverrides(OpOverrides):
         return f"tl.full([], 0x{bits:08X}, tl.uint32).to(tl.float32, bitcast=True)"
 
     @staticmethod
+    def _strict_eager_nan_const(dtype: torch.dtype) -> str:
+        # Eager-NaN bit patterns (all exponent+mantissa bits set, sign clear).
+        if dtype == torch.float32:
+            return TritonOverrides._f32_const_from_bits(0x7FFFFFFF)
+        if dtype == torch.float64:
+            return "tl.full([], 0x7FFFFFFFFFFFFFFF, tl.uint64).to(tl.float64, bitcast=True)"
+        if dtype == torch.float16:
+            return "tl.full([], 0x7FFF, tl.uint16).to(tl.float16, bitcast=True)"
+        if dtype == torch.bfloat16:
+            return "tl.full([], 0x7FFF, tl.uint16).to(tl.bfloat16, bitcast=True)"
+        raise AssertionError(f"unexpected dtype {dtype}")
+
+    @staticmethod
     def _inline_asm_f32(asm: str, args: Sequence[Any], shape: BlockShapeType) -> Any:
         constraints = ", ".join(["=f"] + ["f"] * len(args))
         args_str = ", ".join(map(str, args))
@@ -2854,9 +2867,17 @@ class TritonKernelOverrides(TritonOverrides):
 
         mantissa = V.kernel.cse.newvar(dtype=x.dtype, shape=x.shape)
         exponent = V.kernel.cse.newvar(dtype=torch.int32, shape=x.shape)
-        V.kernel.compute.writeline(
-            f"{mantissa}, {exponent} = triton_helpers.frexp({x})"
-        )
+        if config.numerics == "strict" and x.dtype in _STRICT_FLOAT:
+            # Eager preserves the zero sign in the mantissa and yields
+            # all-bits-set NaN (see triton_helpers.frexp_strict).
+            nan = TritonOverrides._strict_eager_nan_const(x.dtype)
+            V.kernel.compute.writeline(
+                f"{mantissa}, {exponent} = triton_helpers.frexp_strict({x}, {nan})"
+            )
+        else:
+            V.kernel.compute.writeline(
+                f"{mantissa}, {exponent} = triton_helpers.frexp({x})"
+            )
         V.kernel.cse.put(cache_key, (mantissa, exponent))
         return (mantissa, exponent)
 

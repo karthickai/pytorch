@@ -24,6 +24,7 @@ from torch._decomp.decompositions import (
     hardsigmoid as decomp_hardsigmoid,
     hardswish as decomp_hardswish,
     hardswish_backward as decomp_hardswish_backward,
+    logit_backward as decomp_logit_backward,
     pw_cast_for_opmath,
     pw_cast_for_opmath_non_tensor_args,
 )
@@ -155,6 +156,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardswish,  # inductor re-registers with strict reciprocal pin
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
     aten.hardswish_backward,  # inductor re-registers with strict true-division
+    aten.logit_backward,  # inductor re-registers with strict NaN arms
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
@@ -546,6 +548,46 @@ def hardswish_backward(grad_output: torch.Tensor, self: torch.Tensor) -> torch.T
             torch.where(self < 3, grad_output * ((self / three) + 0.5), grad_output),
         )
     return decomp_hardswish_backward(grad_output, self)
+
+
+@register_decomposition([aten.logit_backward])
+def logit_backward(
+    grad_output: torch.Tensor, self: torch.Tensor, eps: float | None = None
+) -> torch.Tensor:
+    if config.numerics != "strict":
+        return decomp_logit_backward(grad_output, self, eps)
+    # Eager yields all-bits-set NaN for NaN inputs in both eps paths, and for
+    # out-of-range narrow inputs without eps (f32 gives canonical NaN there,
+    # matching the base decomposition). Manage dtypes explicitly instead of
+    # pw_cast_for_opmath: the wrapper would upcast narrow inputs before this
+    # body runs, hiding the original dtype the narrow arm depends on.
+    orig_dtype = self.dtype
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        grad_output = grad_output.to(torch.float32)
+        self = self.to(torch.float32)
+    # All-set NaN derived from the input bits so no NaN constant folds; the
+    # outer wheres keep it only for the eager-designated lanes.
+    eager_nan = ((self.view(torch.int32) | -1) & 0x7FFFFFFF).view(torch.float32)
+    if eps is not None:
+        in_range = torch.logical_and(self >= eps, self <= 1.0 - eps)
+        out = torch.where(
+            torch.isnan(self),
+            eager_nan,
+            torch.where(in_range, grad_output / (self * (1.0 - self)), 0.0),
+        )
+    elif orig_dtype in (torch.float16, torch.bfloat16):
+        in_range = torch.logical_and(self >= 0.0, self <= 1.0)
+        formula = grad_output / (self * (1.0 - self))
+        out = torch.where(in_range, formula, eager_nan)
+    else:
+        out = torch.where(
+            torch.isnan(self),
+            eager_nan,
+            decomp_logit_backward(grad_output, self, eps),
+        )
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        out = out.to(orig_dtype)
+    return out
 
 
 @register_decomposition([aten.bmm])
