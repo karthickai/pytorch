@@ -28,6 +28,7 @@ from torch._decomp.decompositions import (
     pw_cast_for_opmath,
     pw_cast_for_opmath_non_tensor_args,
     sigmoid_backward as decomp_sigmoid_backward,
+    tanh_backward as decomp_tanh_backward,
 )
 from torch._decomp.decompositions_for_rng import extra_random_decomps
 from torch._dynamo.utils import counters
@@ -159,6 +160,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardswish_backward,  # inductor re-registers with strict true-division
     aten.logit_backward,  # inductor re-registers with strict NaN arms
     aten.sigmoid_backward,  # inductor re-registers with strict association
+    aten.tanh_backward,  # inductor re-registers with strict FMA
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
@@ -603,6 +605,21 @@ def sigmoid_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.T
     # (Complex keeps the base formula: eager conjugates the inner product,
     # which the base spelling already matches.)
     return (grad_output * (1 - output)) * output
+
+
+@register_decomposition([aten.tanh_backward])
+def tanh_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    if config.numerics != "strict" or output.is_complex():
+        return decomp_tanh_backward(grad_output, output)
+    # Eager (BinaryMiscBackwardOpsKernels.cu) computes grad * (1 - y*y), and
+    # nvcc contracts the 1 - y*y into a single-rounding FMA; strict sets
+    # enable_fp_fusion to False so Triton would round the mul and sub
+    # separately. Spell it via addcmul with value=1 (fma(-y, y, 1)), whose
+    # lowering emits a raw tl.fma; value != 1 would take the mul_rn path
+    # and double-round, which exact rational analysis shows eager is not.
+    # (Complex keeps the base formula, same conjugation reason as above.)
+    one = torch.full((), 1, dtype=output.dtype, device=output.device)
+    return grad_output * torch.addcmul(one, -output, output)
 
 
 @register_decomposition([aten.bmm])

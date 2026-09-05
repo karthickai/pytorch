@@ -798,7 +798,6 @@ BACKWARD_XFAIL = frozenset(
         ("nn_functional_softshrink", "float32"),
         ("nn_functional_tanhshrink", "bfloat16"),
         ("nn_functional_tanhshrink", "float16"),
-        ("nn_functional_tanhshrink", "float32"),
         ("remainder", "float16"),
         ("rsqrt", "bfloat16"),
         ("rsqrt", "float16"),
@@ -814,7 +813,6 @@ BACKWARD_XFAIL = frozenset(
         ("special_xlog1py", "float16"),
         ("tanh", "bfloat16"),
         ("tanh", "float16"),
-        ("tanh", "float32"),
         ("xlogy", "bfloat16"),
         ("xlogy", "float16"),
     }
