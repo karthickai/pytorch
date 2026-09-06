@@ -733,8 +733,6 @@ POINTWISE_XFAIL = frozenset(
         ("mvlgamma_mvlgamma_p_5", "bfloat16"),
         ("mvlgamma_mvlgamma_p_5", "float16"),
         ("mvlgamma_mvlgamma_p_5", "float32"),
-        ("nextafter", "bfloat16"),
-        ("nextafter", "float16"),
         ("nn_functional_gelu", "float32"),
         ("nn_functional_softplus", "float32"),
         ("nn_functional_softshrink", "bfloat16"),

@@ -9198,7 +9198,91 @@ register_pointwise_numeric(aten.erfinv)
 register_pointwise_numeric(aten.hypot)
 register_pointwise_numeric(aten.log10)
 register_pointwise_numeric(aten.log2)
-register_pointwise_numeric(aten.nextafter)
+
+# Infinity bit-patterns of the 16-bit float types; membership also gates the
+# strict nextafter below.
+_NEXTAFTER_INF_BITS = {torch.float16: 0x7C00, torch.bfloat16: 0x7F80}
+
+
+def _strict_nextafter_lowp(x, y, *, dtype):
+    # Port of the 16-bit std::nextafter that eager dispatches to for fp16/bf16
+    # (torch/headeronly/util/BFloat16-math.h, from musl): it steps one code point
+    # of the *storage* type. One fp32 ULP is 2^-13 (fp16) / 2^-16 (bf16) of that,
+    # so libdevice.nextafter's fp32 answer narrows straight back to the input and
+    # the op becomes a no-op. Only the NaN arm leaves the integer domain: eager's
+    # `from + to` is a float add whose narrowing canonicalizes the payload.
+    int_dtype = torch.int16
+    sign_bit = -(1 << 15)
+    abs_mask = (1 << 15) - 1
+    inf_bits = _NEXTAFTER_INF_BITS[dtype]
+
+    def const(value):
+        return ops.constant(value, int_dtype)
+
+    xi = ops.to_dtype_bitcast(x, int_dtype, src_dtype=dtype)
+    yi = ops.to_dtype_bitcast(y, int_dtype, src_dtype=dtype)
+    abs_x = ops.bitwise_and(xi, const(abs_mask))
+    abs_y = ops.bitwise_and(yi, const(abs_mask))
+    either_nan = ops.logical_or(
+        ops.gt(abs_x, const(inf_bits)), ops.gt(abs_y, const(inf_bits))
+    )
+    # abs(from) > abs(to), or the two differ in sign: step towards zero.
+    towards_zero = ops.logical_or(
+        ops.gt(abs_x, abs_y),
+        ops.ne(ops.bitwise_and(ops.bitwise_xor(xi, yi), const(sign_bit)), const(0)),
+    )
+    result = ops.where(
+        either_nan,
+        ops.to_dtype_bitcast(ops.add(x, y), int_dtype, src_dtype=dtype),
+        ops.where(
+            ops.eq(xi, yi),
+            xi,
+            ops.where(
+                ops.eq(abs_x, const(0)),
+                # From +-0.0, `to` decides: its own zero if it is one, else the
+                # smallest subnormal carrying its sign.
+                ops.where(
+                    ops.eq(abs_y, const(0)),
+                    yi,
+                    ops.bitwise_or(ops.bitwise_and(yi, const(sign_bit)), const(1)),
+                ),
+                ops.where(
+                    towards_zero,
+                    ops.sub(xi, const(1)),
+                    ops.add(xi, const(1)),
+                ),
+            ),
+        ),
+    )
+    return ops.to_dtype_bitcast(result, dtype, src_dtype=int_dtype)
+
+
+# Spelled out rather than register_pointwise_numeric(aten.nextafter) so the strict
+# branch can see the storage dtype: by the time ops.nextafter runs, fp16/bf16 has
+# already been upcast to fp32 and the distinction is gone.
+register_op_dtype_propagation_rules(
+    "nextafter",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    override_return_dtype=None,
+)
+register_pointwise_op("nextafter")
+
+
+@register_lowering(
+    aten.nextafter,
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+)
+def nextafter(a, b):
+    dtype = a.get_dtype()
+    if config.numerics == "strict" and dtype in _NEXTAFTER_INF_BITS:
+        inner = functools.partial(_strict_nextafter_lowp, dtype=dtype)
+        return make_pointwise(inner)(a, b)
+    return make_pointwise(ops_wrapper("nextafter"))(a, b)
+
+
+register_lowering(prims.nextafter, type_promotion_kind=None)(nextafter)
+
 
 from .codegen.common import BackendFeature, pointwise_overrides_data
 
