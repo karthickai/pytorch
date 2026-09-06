@@ -1222,11 +1222,24 @@ def ldexp_lowering(x: TensorBox, n: TensorBox):
     else:
         # Fall back to decomposition: x * pow(2, n)
         out_dtype = torch.float32 if is_integer_type(x) else x_dtype
+        narrow_pow = config.numerics == "strict" and out_dtype in (
+            torch.float16,
+            torch.bfloat16,
+        )
 
         def compute_fallback(x, n):
             n_out_type = ops.to_dtype(n, out_dtype)
             two = ops.constant(2.0, out_dtype)
             pow_result = ops.pow(two, n_out_type)
+            if narrow_pow:
+                # Eager materialises 2**n as a tensor in self's dtype (_pow2,
+                # BinaryOps.cpp), so its multiply sees a rounded factor; fusing
+                # pow into this kernel would keep the factor at fp32 and drop
+                # that rounding.
+                pow_result = ops.to_dtype(
+                    ops.to_dtype(pow_result, out_dtype, use_compute_types=False),
+                    out_dtype,
+                )
             return ops.mul(x, pow_result)
 
         return make_pointwise(
