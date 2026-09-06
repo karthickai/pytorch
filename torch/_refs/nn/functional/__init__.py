@@ -549,6 +549,21 @@ def softshrink(a: TensorLikeType, lambd: float = 0.5):
     )
     if a.dtype in (torch.bfloat16, torch.float16):
         lambd = torch.scalar_tensor(lambd, dtype=a.dtype, device=a.device)  # type: ignore[arg-type]
+
+    # py_impl(Autograd) above makes this expression the compiled backward too, so
+    # inductor cannot override softshrink from its own decomposition table.
+    from torch._inductor import config as inductor_config
+
+    if inductor_config.numerics == "strict":
+        # Eager (ActivationSoftshrinkKernel.cu) writes a literal +0 in the dead zone
+        # and returns NaN untouched; `a * 0` below yields -0.0 over the negative half
+        # of the dead zone and canonicalises the NaN payload. Using eager's guard
+        # `-lambd <= a <= lambd`, false for NaN where `abs(a) > lambd` is also false,
+        # fixes the backward as well: the grad becomes `in_dead_zone ? 0 : g`, so NaN
+        # passes the gradient through like eager's shrink_backward.
+        in_dead_zone = torch.logical_and(a >= -lambd, a <= lambd)
+        shrunk = torch.where(in_dead_zone, 0.0, a - torch.sign(a) * lambd)
+        return torch.where(torch.isnan(a), a, shrunk)
     # We implement this in one torch.where to generate better code in the backward
     # see https://github.com/pytorch/pytorch/pull/107052#discussion_r1293748211
     # We multiply by 0 for dealing with nans
