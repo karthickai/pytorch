@@ -7679,7 +7679,12 @@ def pow(a, b):
         if a == 1:
             return full_like(b, 1)
 
-        if a == 2 and is_float_dtype(b.get_dtype()):
+        if a == 2 and is_float_dtype(b.get_dtype()) and config.numerics != "strict":
+            # Eager's pow(Scalar, Tensor) always calls ::pow
+            # (pow_scalar_tensor_impl, PowKernel.cu); libdevice.exp2 and
+            # libdevice.pow(2, x) disagree in the last ulp, so strict keeps the
+            # real pow. Every derivative spelled pow(2, .) lands here, e.g.
+            # ldexp and logaddexp2.
             return exp2(b)
 
     if is_integer_pow:
