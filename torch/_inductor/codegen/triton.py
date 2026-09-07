@@ -1434,6 +1434,18 @@ class TritonOverrides(OpOverrides):
             return f"{x}.to(tl.float32).to({out_dtype})"
 
         if (
+            config.numerics == "strict"
+            and src_dtype == torch.float16
+            and dtype == torch.float64
+        ):
+            # Eager widens fp16 through float, where the hardware collapses every NaN
+            # encoding to 0x7FFFFFFF. Emitting the same two casts is not enough: LLVM
+            # folds fpext(fpext x) into a single widen and drops that canonicalisation.
+            # A select on a runtime predicate survives the fold.
+            nan32 = "tl.full([1], 0x7FFFFFFF, tl.uint32).to(tl.float32, bitcast=True)"
+            return f"tl.where({x} != {x}, {nan32}, {x}.to(tl.float32)).to({out_dtype})"
+
+        if (
             src_dtype is not None
             and dtype in fp8_dtypes
             and (src_dtype == torch.bool or is_integer_dtype(src_dtype))
