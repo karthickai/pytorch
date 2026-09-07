@@ -850,8 +850,6 @@ BACKWARD_XFAIL = frozenset(
         ("float_power", "float32"),
         ("ldexp", "bfloat16"),
         ("ldexp", "float16"),
-        ("ldexp", "float32"),
-        ("logaddexp2", "float32"),
         ("mvlgamma_mvlgamma_p_1", "float32"),
         ("mvlgamma_mvlgamma_p_3", "float32"),
         ("mvlgamma_mvlgamma_p_5", "float32"),
