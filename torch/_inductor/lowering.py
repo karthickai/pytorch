@@ -737,6 +737,7 @@ def make_pointwise(
     override_fn_when_input_bool: Callable[..., Any] | None = None,
     allow_alpha: bool = False,
     use_fma_for_alpha: bool = False,
+    fma_for_alpha_when_strict: bool = False,
     triton_fallback: Callable[..., _T] | None = None,
     round_scalars_to_tensor_dtype: bool = False,
 ) -> Callable[..., TensorBox | _T]:
@@ -761,14 +762,19 @@ def make_pointwise(
             if alpha is not None and alpha != 1:
                 # Use FMA for add-with-alpha on Triton GPU floating-point.
                 # Eager CUDA/ROCm computes a + alpha * b as fma(b, alpha, a).
-                if use_fma_for_alpha and isinstance(inputs[0], IRNode):
+                # Under strict numerics, sub-with-alpha uses the same form:
+                # eager computes a - alpha * b single-rounded, i.e. a + (-alpha) * b.
+                strict_fma = fma_for_alpha_when_strict and config.numerics == "strict"
+                use_fma = use_fma_for_alpha or strict_fma
+                if use_fma and isinstance(inputs[0], IRNode):
                     inp_device = inputs[0].get_device()
                     if (
                         inputs[0].get_dtype().is_floating_point
                         and inp_device is not None
                         and inp_device.type == "cuda"
                     ):
-                        return _add_with_alpha_fma(inputs[0], inputs[1], alpha)
+                        eff_alpha = -alpha if strict_fma else alpha
+                        return _add_with_alpha_fma(inputs[0], inputs[1], eff_alpha)
 
                 # pyrefly: ignore [bad-assignment]
                 inputs = list(inputs)
@@ -1148,6 +1154,7 @@ def register_pointwise(
     override_fn_when_input_bool=None,
     allow_alpha=False,
     use_fma_for_alpha=False,
+    fma_for_alpha_when_strict=False,
     triton_fallback=None,
     round_scalars_to_tensor_dtype=False,
 ):
@@ -1169,6 +1176,7 @@ def register_pointwise(
         override_fn_when_input_bool=override_fn_when_input_bool,
         allow_alpha=allow_alpha,
         use_fma_for_alpha=use_fma_for_alpha,
+        fma_for_alpha_when_strict=fma_for_alpha_when_strict,
         triton_fallback=triton_fallback,
         round_scalars_to_tensor_dtype=round_scalars_to_tensor_dtype,
     )
@@ -8487,7 +8495,12 @@ relu = register_pointwise(aten.relu)
 sigmoid = register_pointwise_numeric_ldf64(aten.sigmoid)
 sqrt = register_pointwise_numeric_ldf64(aten.sqrt)
 square = register_pointwise(aten.square)
-sub = register_pointwise(aten.sub, allow_alpha=True, round_scalars_to_tensor_dtype=True)
+sub = register_pointwise(
+    aten.sub,
+    allow_alpha=True,
+    round_scalars_to_tensor_dtype=True,
+    fma_for_alpha_when_strict=True,
+)
 
 
 @register_lowering(aten.addcmul, broadcast=True)
