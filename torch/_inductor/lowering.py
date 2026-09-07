@@ -7667,18 +7667,30 @@ def var_mean(x, axis=None, *, correction=None, keepdim=False):
     )
 
 
-def pow_recursive(x, y, dtype):
+def pow_recursive(x, y, dtype, round_products=False):
+    """Repeated squaring; round_products rounds every product back to `dtype`.
+
+    The chain is evaluated at the compute dtype, so on fp16/bf16 it rounds only
+    where the caller inserts a cast. round_products makes it round like eager's
+    scalar_t arithmetic instead.
+    """
     if y < 0:
-        return pow_recursive(ops.reciprocal(x), -y, dtype)
+        return pow_recursive(ops.reciprocal(x), -y, dtype, round_products)
     if y == 0:
         return ops.constant(1, dtype)
     if y == 1:
         return x
 
-    result = pow_recursive(x, y // 2, dtype)
-    result = ops.mul(result, result)
+    def product(a, b):
+        out = ops.mul(a, b)
+        if not round_products:
+            return out
+        return ops.to_dtype(ops.to_dtype(out, dtype, use_compute_types=False), dtype)
+
+    result = pow_recursive(x, y // 2, dtype, round_products)
+    result = product(result, result)
     if (y % 2) == 1:
-        result = ops.mul(result, x)
+        result = product(result, x)
     return result
 
 
@@ -7715,13 +7727,24 @@ def pow(a, b):
     )
     if embed_exponent:
         loader = a.make_loader()
+        out_dtype = a.get_dtype()
+        # Exponent 3 is the only power eager spells as repeated multiplication with
+        # an intermediate: pow_tensor_scalar_kernel_impl (PowKernel.cu) is templated
+        # on scalar_t, so `base * base * base` rounds base*base back to fp16/bf16 via
+        # c10::Half/BFloat16 operator*. Exponent 2 has no intermediate, and every
+        # other exponent goes to ::pow, which repeated squaring does not model anyway.
+        round_products = (
+            b == 3
+            and config.numerics == "strict"
+            and out_dtype in (torch.float16, torch.bfloat16)
+        )
 
         def fn(idx):
-            return pow_recursive(loader(idx), b, a.get_dtype())
+            return pow_recursive(loader(idx), b, out_dtype, round_products)
 
         return Pointwise.create(
             device=a.get_device(),
-            dtype=a.get_dtype(),
+            dtype=out_dtype,
             inner_fn=fn,
             ranges=a.get_size(),
         )
