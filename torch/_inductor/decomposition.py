@@ -56,6 +56,11 @@ from torch._refs.special import (
     multigammaln as _refs_multigammaln,
     xlog1py as decomp_xlog1py,
 )
+from torch._refs.nn.functional import (
+    _aten_hardtanh as _refs_aten_hardtanh,
+    softplus as _refs_softplus,
+from torch._refs.special import entr as decomp_entr
+from torch._refs.special import multigammaln as _refs_multigammaln
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
@@ -180,6 +185,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.sigmoid_backward,  # inductor re-registers with strict association
     aten.silu_backward,  # inductor re-registers with strict FMA
     aten.special_xlog1py,  # inductor re-registers with strict NaN canonicalization
+    aten.softplus,  # inductor re-registers with strict true-division
     aten.tanh_backward,  # inductor re-registers with strict FMA
     aten.xlogy,  # inductor re-registers with strict NaN canonicalization
 ]
@@ -751,6 +757,27 @@ def logit_backward(
     if orig_dtype in (torch.float16, torch.bfloat16):
         out = out.to(orig_dtype)
     return out
+
+
+@register_decomposition([aten.softplus])
+def softplus(
+    a: torch.Tensor,
+    beta: torch.types.Number | None = None,
+    threshold: torch.types.Number = 20,
+) -> torch.Tensor:
+    if config.numerics != "strict" or beta is None:
+        return _refs_softplus(a, beta, threshold)
+    # Eager (ActivationSoftplusKernel.cu) truly divides log1p(exp(x*beta)) by
+    # beta at opmath width. The base ref spells the divisor as a Python scalar,
+    # which the strict aten.div lowering pins to eager's *scalar* division --
+    # a reciprocal multiply (BinaryDivTrueKernel.cu) -- so any beta whose
+    # reciprocal is inexact came out 1 ulp off. prims.div keeps a real
+    # division, and unlike a 0-d tensor divisor it does not pull narrow dtypes
+    # onto the scalar_t division path, which eager's opmath kernel is not on.
+    scaled = a * beta
+    return torch.where(
+        scaled > threshold, a, prims.div(torch.log1p(torch.exp(scaled)), beta)
+    )
 
 
 @register_decomposition([aten.sigmoid_backward])
