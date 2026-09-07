@@ -724,10 +724,6 @@ POINTWISE_XFAIL = frozenset(
         ("nn_functional_softplus", "float32"),
         ("special_bessel_y0", "float32"),
         ("special_bessel_y1", "float32"),
-        ("special_xlog1py", "bfloat16"),
-        ("special_xlog1py", "float16"),
-        ("xlogy", "bfloat16"),
-        ("xlogy", "float16"),
     }
 )
 
@@ -751,10 +747,6 @@ BACKWARD_XFAIL = frozenset(
         ("rsqrt", "float16"),
         ("special_bessel_y0", "float32"),
         ("special_bessel_y1", "float32"),
-        ("special_xlog1py", "bfloat16"),
-        ("special_xlog1py", "float16"),
-        ("xlogy", "bfloat16"),
-        ("xlogy", "float16"),
     }
 )
 
