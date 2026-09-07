@@ -36,6 +36,7 @@ from torch._prims_common import (
     type_to_dtype,
 )
 from torch._refs import native_layer_norm as decomp_native_layer_norm
+from torch._refs.nn.functional import _aten_hardtanh as _refs_aten_hardtanh
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
@@ -123,6 +124,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten._softmax_backward_data,
     aten.clamp_max,
     aten.clamp_min,
+    aten.hardtanh,  # inductor skips the refs fp32 opmath upcast under strict
     aten.embedding_dense_backward,  # we fall back on xpu
     aten.native_layer_norm,  # we fall back on mtia
     aten.index_add,  # we conditionally call this decomp
@@ -317,9 +319,7 @@ def sym_constrain_range_for_size(
     return
 
 
-@register_decomposition([aten.clamp])
-@pw_cast_for_opmath_non_tensor_args
-def clamp(
+def _clamp_impl(
     x: torch.Tensor,
     min: torch.types.Number | None = None,
     max: torch.types.Number | None = None,
@@ -329,6 +329,58 @@ def clamp(
     if max is not None:
         x = x.clamp_max(max)
     return x
+
+
+def _hardtanh_nocast(
+    a: torch.Tensor,
+    min_val: torch.types.Number = -1,
+    max_val: torch.types.Number = 1,
+) -> torch.Tensor:
+    return torch.clamp(a, min_val, max_val)
+
+
+@register_decomposition([aten.hardtanh.default, aten.hardtanh.out])
+def hardtanh(
+    a: torch.Tensor,
+    min_val: torch.types.Number = -1,
+    max_val: torch.types.Number = 1,
+    inplace: bool = False,
+    **kwargs,
+):
+    if (
+        config.numerics == "strict"
+        and not kwargs
+        and not inplace
+        and a.dtype.is_floating_point
+    ):
+        # Skip the refs promotion wrapper: it upcasts fp16/bf16 inputs to
+        # fp32 opmath, and cvt.f32.f16/cvt.f32.bf16 canonicalizes NaN payloads
+        # before clamp ever sees them. torch.clamp promotes identically for
+        # these dtypes, so nothing else changes.
+        return _hardtanh_nocast(a, min_val, max_val)
+    # Keywords: the refs wrapper chain misbinds a positional `inplace`.
+    return _refs_aten_hardtanh(
+        a, min_val=min_val, max_val=max_val, inplace=inplace, **kwargs
+    )
+
+
+_clamp_opmath = pw_cast_for_opmath_non_tensor_args(_clamp_impl)
+
+
+@register_decomposition([aten.clamp])
+def clamp(
+    x: torch.Tensor,
+    min: torch.types.Number | None = None,
+    max: torch.types.Number | None = None,
+) -> torch.Tensor:
+    if config.numerics == "strict":
+        # Skip the fp32 opmath upcast: cvt.f32.f16/cvt.f32.bf16 canonicalizes
+        # NaN payloads, so computing the clamp chain in fp32 cannot match
+        # eager's payload-preserving narrow result. min/max need no extra
+        # precision, and scalar bounds are unaffected (bound width is
+        # unobservable once the output is narrowed).
+        return _clamp_impl(x, min, max)
+    return _clamp_opmath(x, min, max)
 
 
 # Inductor-specific SiLU decomposition for exact eager matching.
