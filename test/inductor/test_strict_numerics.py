@@ -712,6 +712,11 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 # message tags each mismatching call as nan-payload, signed-zero or value.
 POINTWISE_XFAIL: frozenset[tuple[str, str]] = frozenset()
 
+# grad1 for pow(base<0, NaN) is `result * log(base)`, where both operands are NaN. Eager
+# returns log's -qNaN, Inductor returns pow's result. Not fixable: LLVM canonicalises
+# commutative fp operands so `a*b` and `b*a` compile identically, ptxas picks the surviving
+# operand from surrounding register pressure, and eager itself is inconsistent (its mul takes
+# the second operand, its add/sub/div the first). There is no rule to match.
 BACKWARD_XFAIL = frozenset(
     {
         ("float_power", "float32"),
