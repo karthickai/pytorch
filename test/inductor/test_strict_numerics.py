@@ -721,11 +721,7 @@ BACKWARD_XFAIL = frozenset(
     }
 )
 
-NONFLOAT_XFAIL = frozenset(
-    {
-        ("nn_functional_silu_complex", "complex128"),
-    }
-)
+NONFLOAT_XFAIL: frozenset[tuple[str, str]] = frozenset()
 
 POINTWISE_STRICT_CFG = {
     # The base inductor TestCase already gives every test a fresh, isolated (cold) cache
