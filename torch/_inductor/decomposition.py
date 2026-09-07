@@ -545,6 +545,11 @@ def clamp(
 @register_decomposition([aten.silu])
 @pw_cast_for_opmath
 def silu(x: torch.Tensor) -> torch.Tensor:
+    if config.numerics == "strict" and x.is_complex():
+        # Complex has no Triton lowering, so each op of the decomposition becomes its
+        # own ATen call over c10::complex, while eager runs the whole formula in one
+        # kernel. Fall back to that kernel rather than reproduce it op by op.
+        return NotImplemented
     return x / (1 + x.neg().exp())
 
 

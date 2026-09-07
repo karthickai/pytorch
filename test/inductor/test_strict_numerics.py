@@ -809,11 +809,7 @@ BACKWARD_XFAIL = frozenset(
     }
 )
 
-NONFLOAT_XFAIL = frozenset(
-    {
-        ("nn_functional_silu_complex", "complex128"),
-    }
-)
+NONFLOAT_XFAIL = frozenset({})
 
 POINTWISE_STRICT_CFG = {
     "numerics": "strict",
