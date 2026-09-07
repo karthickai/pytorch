@@ -45,10 +45,16 @@ from torch._prims_common import (
     type_to_dtype,
 )
 from torch._prims_common.wrappers import out_wrapper
-from torch._refs import native_layer_norm as decomp_native_layer_norm
+from torch._refs import (
+    native_layer_norm as decomp_native_layer_norm,
+    xlogy as decomp_xlogy,
+)
 from torch._refs.nn.functional import _aten_hardtanh as _refs_aten_hardtanh
-from torch._refs.special import entr as decomp_entr
-from torch._refs.special import multigammaln as _refs_multigammaln
+from torch._refs.special import (
+    entr as decomp_entr,
+    multigammaln as _refs_multigammaln,
+    xlog1py as decomp_xlog1py,
+)
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
@@ -171,7 +177,9 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.mvlgamma,  # inductor re-registers with strict reduction order
     aten.sigmoid_backward,  # inductor re-registers with strict association
     aten.silu_backward,  # inductor re-registers with strict FMA
+    aten.special_xlog1py,  # inductor re-registers with strict NaN canonicalization
     aten.tanh_backward,  # inductor re-registers with strict FMA
+    aten.xlogy,  # inductor re-registers with strict NaN canonicalization
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
@@ -220,6 +228,45 @@ def special_entr(a: torch.Tensor) -> torch.Tensor:
     # no NaN constant can fold.
     eager_nan = ((a.view(torch.int16) | -1) & 0x7FFF).view(a.dtype)
     return torch.where(torch.isnan(a), eager_nan, res)
+
+
+def _strict_xlogy_nan(res: torch.Tensor) -> torch.Tensor:
+    """Give xlogy's NaNs the encoding eager's narrowing store leaves behind.
+
+    xlogy_kernel_cuda / xlog1py_kernel_cuda are instantiated at scalar_t, so both of
+    their NaN-producing returns -- `NAN` and `x * std::log(y)` -- narrow an fp32 value
+    on device, and NVIDIA's cvt canonicalizes every NaN to the all-set +0x7FFF. The
+    ref's NaN arm is an fp32 constant instead, and under emulate_precision_casts LLVM
+    sinks the narrowing into the select and folds it by payload truncation, giving
+    0x7FC0 (bf16) / 0x7E00 (fp16). Deriving the all-set NaN from the result's own bits
+    leaves no constant to fold; canonicalizing every NaN output rather than just that
+    arm is exact because eager cannot emit any other NaN at 16 bits. fp32 never narrows
+    and already matches, hence the dtype gate.
+    """
+    if (
+        config.numerics != "strict"
+        or res.device.type != "cuda"
+        or res.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return res
+    eager_nan = ((res.view(torch.int16) | -1) & 0x7FFF).view(res.dtype)
+    return torch.where(torch.isnan(res), eager_nan, res)
+
+
+@register_decomposition([aten.xlogy])
+def xlogy(
+    a: torch.Tensor | torch.types.Number, b: torch.Tensor | torch.types.Number
+) -> torch.Tensor:
+    return _strict_xlogy_nan(decomp_xlogy(a, b))
+
+
+@register_decomposition([aten.special_xlog1py])
+def special_xlog1py(
+    a: torch.Tensor | torch.types.Number, b: torch.Tensor | torch.types.Number
+) -> torch.Tensor:
+    return _strict_xlogy_nan(decomp_xlog1py(a, b))
+
+
 def _cuda_trailing_sum(terms: list[torch.Tensor]) -> torch.Tensor:
     """Add `terms` in the order ATen's CUDA reduction walks a short trailing dim.
 
