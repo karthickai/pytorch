@@ -581,12 +581,28 @@ def broadcast_symbolic_shapes(a, b):
     return tuple(reversed(output))
 
 
+def _all_ones_nan(dtype: torch.dtype, int_dtype: torch.dtype) -> float:
+    bits = (1 << (dtype.itemsize * 8 - 1)) - 1
+    return torch.tensor([bits], dtype=int_dtype).view(dtype).item()
+
+
+# The NaN a CUDA float arithmetic op returns whatever its operands' payloads were: all
+# exponent and mantissa bits set, sign clear. float64 propagates the operand payload
+# instead of canonicalising, so it is deliberately absent.
+_CUDA_CANONICAL_NAN = {
+    torch.float16: _all_ones_nan(torch.float16, torch.int16),
+    torch.bfloat16: _all_ones_nan(torch.bfloat16, torch.int16),
+    torch.float32: _all_ones_nan(torch.float32, torch.int32),
+}
+
+
 def promote_constants(
     inputs: Sequence[_T],
     override_return_dtype: torch.dtype | None = None,
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None = None,
     round_scalar_constants: bool = False,
     round_scalars_to_tensor_dtype: bool = False,
+    selects_scalar_operand: bool = False,
 ) -> Sequence[_T | BaseView | BaseConstant]:
     """Convert raw Python scalars and sympy expressions in inputs to IR constants.
 
@@ -597,7 +613,9 @@ def promote_constants(
     (override_return_dtype == torch.bool) and for callers passing
     round_scalar_constants (e.g. remainder); on CPU and MPS only for ops
     passing round_scalars_to_tensor_dtype (e.g. add/sub, whose CUDA eager
-    kernels keep scalars at opmath precision).
+    kernels keep scalars at opmath precision). Callers whose op can return the
+    scalar unchanged rather than compute with it (clamp's bounds) pass
+    selects_scalar_operand, which keeps a NaN scalar's exact bits.
     """
     if not (override_return_dtype is None or type_promotion_kind is None):
         raise AssertionError(
@@ -644,13 +662,31 @@ def promote_constants(
     else:
         _round_scalar = lambda v: v  # noqa: E731
 
+    # Eager hands a scalar operand to its kernel as an argument, so an operation with a
+    # NaN operand really runs and the device returns its canonical NaN. Inductor bakes
+    # the scalar in as an immediate and the compiler folds the operation to that
+    # immediate, so substitute the value the device would have produced. Only operands
+    # go through here; fill values (full, where, masked_fill) build their Constant
+    # directly and keep eager's host-narrowed bit pattern.
+    canonicalize_nan = (
+        config.numerics == "strict"
+        and not selects_scalar_operand
+        and tensor_dtype in _CUDA_CANONICAL_NAN
+        and ex.get_device_or_error().type == "cuda"
+    )
+
+    def _promote_scalar(v):
+        if canonicalize_nan and isinstance(v, float) and math.isnan(v):
+            return _CUDA_CANONICAL_NAN[tensor_dtype]
+        return _round_scalar(v)
+
     out = []
     for x in inputs:
         if isinstance(x, (int, float)):
             out.append(
                 ExpandView.create(
                     ir.Constant(
-                        value=_round_scalar(x),
+                        value=_promote_scalar(x),
                         dtype=tensor_dtype,
                         device=ex.get_device_or_error(),
                     ),
@@ -740,6 +776,7 @@ def make_pointwise(
     fma_for_alpha_when_strict: bool = False,
     triton_fallback: Callable[..., _T] | None = None,
     round_scalars_to_tensor_dtype: bool = False,
+    selects_scalar_operand: bool = False,
 ) -> Callable[..., TensorBox | _T]:
     """Wraps a pointwise fn and returns a function representing the pointwise in
     the define-by-run IR."""
@@ -757,6 +794,7 @@ def make_pointwise(
             inputs,
             override_return_dtype,
             round_scalars_to_tensor_dtype=round_scalars_to_tensor_dtype,
+            selects_scalar_operand=selects_scalar_operand,
         )
         if allow_alpha:
             if alpha is not None and alpha != 1:
@@ -9013,7 +9051,7 @@ def _strict_clamp_link(a, b, dtype, *, is_min):
                 ),
             )
 
-    return make_pointwise(inner)(a, b)
+    return make_pointwise(inner, selects_scalar_operand=True)(a, b)
 
 
 def _strict_clamp_bound(b, a, dtype):
