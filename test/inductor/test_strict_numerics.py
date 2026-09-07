@@ -710,12 +710,7 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 # (op_id, dtype_label) pairs not yet bitwise-identical to eager under strict numerics,
 # generated from a full run on sm_100. Every entry is a real difference; the failure
 # message tags each mismatching call as nan-payload, signed-zero or value.
-POINTWISE_XFAIL = frozenset(
-    {
-        ("special_bessel_y0", "float32"),
-        ("special_bessel_y1", "float32"),
-    }
-)
+POINTWISE_XFAIL: frozenset[tuple[str, str]] = frozenset()
 
 BACKWARD_XFAIL = frozenset(
     {
@@ -725,8 +720,6 @@ BACKWARD_XFAIL = frozenset(
         ("mvlgamma_mvlgamma_p_5", "float32"),
         ("rsqrt", "bfloat16"),
         ("rsqrt", "float16"),
-        ("special_bessel_y0", "float32"),
-        ("special_bessel_y1", "float32"),
     }
 )
 

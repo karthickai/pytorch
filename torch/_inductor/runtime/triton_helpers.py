@@ -1393,6 +1393,185 @@ def aten_bessel_j1(x):
 
 
 @triton.jit
+def aten_bessel_y0(x):
+    """Cephes bessel_y0_forward, as eager's CUDA jiterator evaluates it.
+
+    Port of ``bessel_y0_string`` in aten/src/ATen/native/cuda/Math.cuh; the
+    branches there become selects, so every arm is evaluated for every lane.
+    """
+    pp: tl.constexpr = (
+        7.96936729297347051624e-04,
+        8.28352392107440799803e-02,
+        1.23953371646414299388e00,
+        5.44725003058768775090e00,
+        8.74716500199817011941e00,
+        5.30324038235394892183e00,
+        9.99999999999999997821e-01,
+    )
+    pq: tl.constexpr = (
+        9.24408810558863637013e-04,
+        8.56288474354474431428e-02,
+        1.25352743901058953537e00,
+        5.47097740330417105182e00,
+        8.76190883237069594232e00,
+        5.30605288235394617618e00,
+        1.00000000000000000218e00,
+    )
+    qp: tl.constexpr = (
+        -1.13663838898469149931e-02,
+        -1.28252718670509318512e00,
+        -1.95539544257735972385e01,
+        -9.32060152123768231369e01,
+        -1.77681167980488050595e02,
+        -1.47077505154951170175e02,
+        -5.14105326766599330220e01,
+        -6.05014350600728481186e00,
+    )
+    qq: tl.constexpr = (
+        6.43178256118178023184e01,
+        8.56430025976980587198e02,
+        3.88240183605401609683e03,
+        7.24046774195652478189e03,
+        5.93072701187316984827e03,
+        2.06209331660327847417e03,
+        2.42005740240291393179e02,
+    )
+    yp: tl.constexpr = (
+        1.55924367855235737965e04,
+        -1.46639295903971606143e07,
+        5.43526477051876500413e09,
+        -9.82136065717911466409e11,
+        8.75906394395366999549e13,
+        -3.46628303384729719441e15,
+        4.42733268572569800351e16,
+        -1.84950800436986690637e16,
+    )
+    yq: tl.constexpr = (
+        1.04128353664259848412e03,
+        6.26107330137134956842e05,
+        2.68919633393814121987e08,
+        8.64002487103935000337e10,
+        2.02979612750105546709e13,
+        3.17157752842975028269e15,
+        2.50596256172653059228e17,
+    )
+    xx = x * x
+
+    # Math.cuh:1645 writes a bare `NAN;` where it means `return NAN;`, so x < 0
+    # reaches this arm and comes back NaN only because log(x) does. Reproducing
+    # eager means reproducing that, not the intent. NVVM (not ptxas) contracts
+    # the trailing `+ (2/pi * log(x)) * J0(x)`, so spell the fma out.
+    small = tl.fma(
+        libdevice.log(x) * 0.636619772367581343075535053490057448,
+        aten_bessel_j0(x),
+        tl.div_rn(_aten_bessel_poly(xx, yp), _aten_bessel_poly(xx, yq)),
+    )
+    small = tl.where(x == 0.0, float("-inf"), small)
+
+    t = tl.div_rn(tl.full(x.shape, 25.0, tl.float32), xx)
+    w = x - 0.785398163397448309615660845819875721
+    a = tl.div_rn(_aten_bessel_poly(t, pp), _aten_bessel_poly(t, pq)) * libdevice.sin(w)
+    b = tl.div_rn(tl.full(x.shape, 5.0, tl.float32), x) * tl.div_rn(
+        _aten_bessel_poly(t, qp), _aten_bessel_poly(t, qq)
+    )
+    large = tl.div_rn(
+        tl.fma(b, libdevice.cos(w), a) * 0.797884560802865355879892119868763737,
+        tl.sqrt_rn(x),
+    )
+    return tl.where(x <= 5.0, small, large)
+
+
+@triton.jit
+def aten_bessel_y1(x):
+    """Cephes bessel_y1_forward, as eager's CUDA jiterator evaluates it.
+
+    Port of ``bessel_y1_string`` in aten/src/ATen/native/cuda/Math.cuh; the
+    branches there become selects, so every arm is evaluated for every lane.
+    """
+    pp: tl.constexpr = (
+        7.62125616208173112003e-04,
+        7.31397056940917570436e-02,
+        1.12719608129684925192e00,
+        5.11207951146807644818e00,
+        8.42404590141772420927e00,
+        5.21451598682361504063e00,
+        1.00000000000000000254e00,
+    )
+    pq: tl.constexpr = (
+        5.71323128072548699714e-04,
+        6.88455908754495404082e-02,
+        1.10514232634061696926e00,
+        5.07386386128601488557e00,
+        8.39985554327604159757e00,
+        5.20982848682361821619e00,
+        9.99999999999999997461e-01,
+    )
+    qp: tl.constexpr = (
+        5.10862594750176621635e-02,
+        4.98213872951233449420e00,
+        7.58238284132545283818e01,
+        3.66779609360150777800e02,
+        7.10856304998926107277e02,
+        5.97489612400613639965e02,
+        2.11688757100572135698e02,
+        2.52070205858023719784e01,
+    )
+    qq: tl.constexpr = (
+        7.42373277035675149943e01,
+        1.05644886038262816351e03,
+        4.98641058337653607651e03,
+        9.56231892404756170795e03,
+        7.99704160447350683650e03,
+        2.82619278517639096600e03,
+        3.36093607810698293419e02,
+    )
+    yp: tl.constexpr = (
+        1.26320474790178026440e09,
+        -6.47355876379160291031e11,
+        1.14509511541823727583e14,
+        -8.12770255501325109621e15,
+        2.02439475713594898196e17,
+        -7.78877196265950026825e17,
+    )
+    yq: tl.constexpr = (
+        5.94301592346128195359e02,
+        2.35564092943068577943e05,
+        7.34811944459721705660e07,
+        1.87601316108706159478e10,
+        3.88231277496238566008e12,
+        6.20557727146953693363e14,
+        6.87141087355300489866e16,
+        3.97270608116560655612e18,
+    )
+    xx = x * x
+
+    # Math.cuh:1871 does `return NAN;` for x < 0, unlike y0's dropped return, but
+    # log(x) already yields that same canonical NaN here, so no select is needed.
+    small = tl.fma(
+        x,
+        tl.div_rn(_aten_bessel_poly(xx, yp), _aten_bessel_poly(xx, yq)),
+        tl.fma(
+            libdevice.log(x),
+            aten_bessel_j1(x),
+            tl.div_rn(tl.full(x.shape, -1.0, tl.float32), x),
+        )
+        * 0.636619772367581343075535053490057448,
+    )
+    small = tl.where(x == 0.0, float("-inf"), small)
+
+    u = tl.div_rn(tl.full(x.shape, 5.0, tl.float32), x)
+    t = u * u
+    w = x - 2.356194490192344928846982537459627163
+    a = tl.div_rn(_aten_bessel_poly(t, pp), _aten_bessel_poly(t, pq)) * libdevice.sin(w)
+    b = u * tl.div_rn(_aten_bessel_poly(t, qp), _aten_bessel_poly(t, qq))
+    large = tl.div_rn(
+        tl.fma(b, libdevice.cos(w), a) * 0.797884560802865355879892119868763737,
+        tl.sqrt_rn(x),
+    )
+    return tl.where(x <= 5.0, small, large)
+
+
+@triton.jit
 def is_floating(x):
     return promote_to_tensor(x).dtype.is_floating()
 
