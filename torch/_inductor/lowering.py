@@ -1396,20 +1396,37 @@ def isnan(x):
     return make_pointwise(fn, override_return_dtype=torch.bool)(x)
 
 
+def _strict_libdevice_fn(name, x):
+    # ceil/floor/round/trunc lower to libdevice, which has no fp16/bf16
+    # overloads. Under strict, fused explicit-narrow producers can feed narrow
+    # IR straight into these lowerings; widen exactly first (eager promotes
+    # there too, and the widening is exact). Unfused loads arrive already
+    # widened, where the extra cast is a harmless no-op.
+    fn = ops_wrapper(name)
+    if (
+        config.numerics == "strict"
+        and isinstance(x, (TensorBox, ExpandView))
+        and x.get_dtype() in (torch.float16, torch.bfloat16)
+    ):
+
+        def fn(x, inner=fn):
+            return inner(ops.to_dtype(x, torch.float32))
+
+    return fn
+
+
 @register_lowering(aten.ceil)
 def ceil(x):
     if is_integer_type(x):
         return clone(x)
-    fn = ops_wrapper("ceil")
-    return make_pointwise(fn)(x)
+    return make_pointwise(_strict_libdevice_fn("ceil", x))(x)
 
 
 @register_lowering(aten.floor)
 def floor(x):
     if is_integer_type(x):
         return clone(x)
-    fn = ops_wrapper("floor")
-    return make_pointwise(fn)(x)
+    return make_pointwise(_strict_libdevice_fn("floor", x))(x)
 
 
 @register_lowering(aten.round.default)
@@ -1417,16 +1434,14 @@ def round(x):
     if is_integer_type(x):
         return clone(x)
     else:
-        fn = ops_wrapper("round")
-        return make_pointwise(fn)(x)
+        return make_pointwise(_strict_libdevice_fn("round", x))(x)
 
 
 @register_lowering(aten.trunc)
 def trunc(x):
     if is_integer_type(x):
         return clone(x)
-    fn = ops_wrapper("trunc")
-    return make_pointwise(fn)(x)
+    return make_pointwise(_strict_libdevice_fn("trunc", x))(x)
 
 
 @register_lowering(aten.expand, type_promotion_kind=None)
@@ -7766,17 +7781,44 @@ def _strict_floor_div_floating(a, b, ref):
     # to quotient rounding), general sign correction, floor with a 0.5
     # correction, and signed zero via copysign. NaN outputs use eager's
     # all-bits-set convention; the b == 0 arm returns a / b directly.
+    #
+    # Widths mirror the kernel exactly: its `auto` temporaries promote
+    # mod/div/correction to float, narrowing only at the scalar_t
+    # floordiv assignment, the += 1, and the copysign divide. Everything
+    # else (f32 included) computes on the widened loads.
     dtype = ref.get_dtype()
     int_dtype, nan_bits = _STRICT_EAGER_NAN_BITS[dtype]
+    narrow = dtype in (torch.float16, torch.bfloat16)
     zero = constant_like(0.0)(ref)
     one = constant_like(1.0)(ref)
     half = constant_like(0.5)(ref)
     neg_zero = constant_like(-0.0)(ref)
 
+    def narrow_const(bits):
+        # Narrow scalar constants as int bitcasts: plain constants fold at
+        # trace time and codegen re-widens them via compute types, which would
+        # promote the narrow arithmetic back to fp32. All four values are
+        # exactly representable, so the bitcast equals the eager scalar. The
+        # trailing downcast undoes codegen's compute-type upcast of the
+        # bitcast itself (exact round trip).
+        wide = ops.to_dtype_bitcast(
+            ops.constant(bits, int_dtype), dtype, src_dtype=int_dtype
+        )
+        return ops.to_dtype(wide, dtype, use_compute_types=False)
+
+    def narrow_to(v):
+        # Downcast dynamic values to narrow (exact for loads of narrow
+        # buffers). Constants must use narrow_const instead (see above).
+        return ops.to_dtype(v, dtype, use_compute_types=False)
+
     def fn(a, b, zero, one, half, neg_zero):
         nan = ops.to_dtype_bitcast(
             ops.constant(nan_bits, int_dtype), dtype, src_dtype=int_dtype
         )
+        if narrow:
+            # scalar_t assignment and scalar_t arithmetic only; the fmod,
+            # quotient, correction, and comparisons stay fp32 like eager.
+            one = narrow_const(0x3C00 if dtype == torch.float16 else 0x3F80)
         mod = ops.fmod(a, b)
         quot = ops.div_rn(ops.sub(a, mod), b)
         div = ops.where(
@@ -7786,11 +7828,17 @@ def _strict_floor_div_floating(a, b, ref):
             ops.sub(quot, one),
             quot,
         )
-        fl = ops.floor(div)
+        fl = narrow_to(ops.floor(div)) if narrow else ops.floor(div)
         floordiv = ops.where(ops.gt(ops.sub(div, fl), half), ops.add(fl, one), fl)
+        if narrow:
+            copysign_div = ops.to_dtype(
+                ops.div_rn(narrow_to(a), narrow_to(b)), torch.float32
+            )
+        else:
+            copysign_div = ops.div_rn(a, b)
         result = ops.where(
             ops.eq(div, zero),
-            ops.where(ops.signbit(ops.div_rn(a, b)), neg_zero, zero),
+            ops.where(ops.signbit(copysign_div), neg_zero, zero),
             floordiv,
         )
         result = ops.where(ops.logical_or(ops.isnan(a), ops.isnan(b)), nan, result)
@@ -7871,12 +7919,84 @@ def div_mode(a, b, rounding_mode=None):
     return div(a, b)
 
 
+def _strict_narrow_arith_dtype(args):
+    # Narrow computation dtype for strict-numerics explicit-narrow arithmetic:
+    # every tensor operand is the same narrow float on CUDA, so eager computes
+    # the op in scalar_t. Raw Python scalars are excluded above (eager scalar
+    # kernels use opmath precision); 0-d tensors are boxes and narrow via the
+    # bitcast path. Anything else (mixed widths, symbolic shapes, complex,
+    # non-CUDA) keeps the default path.
+    if any(isinstance(x, sympy.Basic) for x in args):
+        return None
+    if any(isinstance(x, (int, float)) for x in args):
+        # Raw Python scalars stay on the default path: eager scalar kernels
+        # compute in opmath precision (fp32) and narrow on store, which is
+        # exactly what emulation does. (0-d tensors are boxes, not scalars,
+        # and narrow correctly via the bitcast path below.)
+        return None
+    dtype = _strict_cuda_float_dtype(args)
+    if dtype is None or dtype not in (torch.float16, torch.bfloat16):
+        return None
+    boxes = [x for x in args if isinstance(x, (TensorBox, ExpandView))]
+    if not boxes or any(x.get_dtype() != dtype for x in boxes):
+        return None
+    return dtype
+
+
+def _strict_narrow_const_bits(x, dtype):
+    # Scalar operand value as narrow int bits for bitcast emission, else None.
+    # Narrow constants cannot go through ops.to_dtype: trace-time folding
+    # reduces them to plain constants, which codegen re-widens via compute
+    # types. Bitcasting from int bits (Fix-4 abs pattern) survives intact.
+    if isinstance(x, bool):
+        return None
+    try:
+        const = get_constant_value(x)
+    except Exception:
+        return None
+    if const is None:
+        return None
+    value = const.value
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    int_dtype = torch.int16 if dtype.itemsize == 2 else torch.int32
+    return int(torch.tensor(value, dtype=dtype).view(int_dtype).item())
+
+
+def _strict_narrow_arg(v, bits, dtype):
+    # Narrow one pointwise operand: dynamic values downcast (exact for loads
+    # of narrow buffers), constants bitcast from precomputed bits. The
+    # bitcast needs a second downcast because codegen appends a compute-type
+    # upcast to every narrow bitcast; the round trip is exact for the
+    # exactly-representable constants that reach here.
+    if bits is not None:
+        int_dtype = torch.int16 if dtype.itemsize == 2 else torch.int32
+        wide = ops.to_dtype_bitcast(
+            ops.constant(bits, int_dtype), dtype, src_dtype=int_dtype
+        )
+        return ops.to_dtype(wide, dtype, use_compute_types=False)
+    return ops.to_dtype(v, dtype, use_compute_types=False)
+
+
 @register_lowering([aten.mul], broadcast=True)
 def mul(a, b):
     both_bool = is_boolean_type(a) and is_boolean_type(b)
     if both_bool:
         return logical_and(a, b)
     else:
+        dtype = _strict_narrow_arith_dtype((a, b))
+        if dtype is not None:
+            # Eager computes narrow tensor products in scalar_t, but the
+            # widened loads would multiply in fp32. Narrow explicitly; rint
+            # and other exact consumers widen back exactly at their loads.
+            bits = tuple(_strict_narrow_const_bits(x, dtype) for x in (a, b))
+
+            def narrow_fn(a, b):
+                return ops.mul(
+                    *(_strict_narrow_arg(v, bit, dtype) for v, bit in zip((a, b), bits))
+                )
+
+            return make_pointwise(narrow_fn)(a, b)
         fn = ops_wrapper(aten.mul.__name__)
         return make_pointwise(fn)(a, b)
 
@@ -7987,6 +8107,27 @@ def div(a, b):
     a, b = promote_constants(
         (a, b), type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
     )
+    dtype = _strict_narrow_arith_dtype((a, b))
+    if dtype is not None:
+        # Eager tensor-tensor division runs in scalar_t (true division), but
+        # the widened loads would divide in fp32. Narrow explicitly. Python
+        # scalars took the reciprocal branch above and never reach here.
+        bits = tuple(_strict_narrow_const_bits(x, dtype) for x in (a, b))
+
+        def narrow_fn(a, b):
+            quot = ops.div_rn(
+                *(
+                    ops.to_dtype(_strict_narrow_arg(v, bit, dtype), torch.float32)
+                    for v, bit in zip((a, b), bits)
+                )
+            )
+            # Triton divides narrow operands at fp32 precision without
+            # rounding back to scalar_t, but eager divides in scalar_t, so
+            # narrow the quotient explicitly. The widenings are exact and
+            # the trailing downcast is a real cvt.
+            return ops.to_dtype(quot, dtype, use_compute_types=False)
+
+        return make_pointwise(narrow_fn)(a, b)
     return div_prim(a, b)
 
 
