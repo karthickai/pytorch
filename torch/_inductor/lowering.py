@@ -7738,8 +7738,18 @@ def pow(a, b):
             # ldexp and logaddexp2.
             return exp2(b)
 
-    if is_integer_pow:
-        # ops.pow doesn't work for integers
+    device = next(x.get_device() for x in (a, b) if isinstance(x, ir.TensorBox))
+    # ops.pow doesn't work for integers. fp64 falls back too under strict numerics:
+    # libdevice's double-precision pow contracts its internal multiply-adds when nvcc
+    # builds ATen, but strict compiles Triton with fp fusion off, which flips the last
+    # bit on roughly 1e-5 of ordinary inputs. Triton has no per-callee fusion control,
+    # and only float_power reaches fp64 pow, so the lost fusion costs little.
+    if is_integer_pow or (
+        config.numerics == "strict"
+        and dtype == torch.float64
+        and device is not None
+        and device.type == "cuda"
+    ):
         if isinstance(a, Number):
             return fallback_pow_scalar(a, b)
         elif isinstance(b, Number):

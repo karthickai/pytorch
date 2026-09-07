@@ -46,22 +46,20 @@ from torch._prims_common import (
 )
 from torch._prims_common.wrappers import out_wrapper
 from torch._refs import (
+    logaddexp2 as _refs_logaddexp2,
     native_layer_norm as decomp_native_layer_norm,
     xlogy as decomp_xlogy,
-    logaddexp2 as _refs_logaddexp2,
-)
-from torch._refs.nn.functional import _aten_hardtanh as _refs_aten_hardtanh
-from torch._refs.special import (
-    entr as decomp_entr,
-    multigammaln as _refs_multigammaln,
-    xlog1py as decomp_xlog1py,
 )
 from torch._refs.nn.functional import (
     _aten_hardtanh as _refs_aten_hardtanh,
     gelu as _refs_gelu,
     softplus as _refs_softplus,
-from torch._refs.special import entr as decomp_entr
-from torch._refs.special import multigammaln as _refs_multigammaln
+)
+from torch._refs.special import (
+    entr as decomp_entr,
+    multigammaln as _refs_multigammaln,
+    xlog1py as decomp_xlog1py,
+)
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
