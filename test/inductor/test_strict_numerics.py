@@ -792,8 +792,6 @@ POINTWISE_XFAIL = frozenset(
         ("neg", "bfloat16"),
         ("neg", "float16"),
         ("neg", "float32"),
-        ("special_bessel_y0", "float32"),
-        ("special_bessel_y1", "float32"),
     }
 )
 
@@ -810,8 +808,6 @@ BACKWARD_XFAIL = frozenset(
         ("mvlgamma_mvlgamma_p_5", "float32"),
         ("rsqrt", "bfloat16"),
         ("rsqrt", "float16"),
-        ("special_bessel_y0", "float32"),
-        ("special_bessel_y1", "float32"),
     }
 )
 

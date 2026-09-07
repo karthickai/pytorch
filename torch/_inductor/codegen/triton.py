@@ -2791,6 +2791,18 @@ class TritonKernelOverrides(TritonOverrides):
             return f"triton_helpers.aten_bessel_j1({x})"
         return cast(Any, TritonOverrides).bessel_j1(x)
 
+    @staticmethod
+    def bessel_y0(x):
+        if TritonKernelOverrides._use_aten_fp32_special(x):
+            return f"triton_helpers.aten_bessel_y0({x})"
+        return cast(Any, TritonOverrides).bessel_y0(x)
+
+    @staticmethod
+    def bessel_y1(x):
+        if TritonKernelOverrides._use_aten_fp32_special(x):
+            return f"triton_helpers.aten_bessel_y1({x})"
+        return cast(Any, TritonOverrides).bessel_y1(x)
+
     @classmethod
     def constant(cls, value, dtype):
         # NOTE: Cannot use shape=[] as it's not supported by triton-rocm
