@@ -1424,6 +1424,16 @@ class TritonOverrides(OpOverrides):
             return f"{x}.to(tl.int32).to({out_dtype})"
 
         if (
+            config.numerics == "strict"
+            and src_dtype == torch.float64
+            and dtype in (torch.float16, torch.bfloat16)
+            and out_dtype == triton_type(dtype)
+        ):
+            # c10::Half and c10::BFloat16 only construct from float, so eager narrows
+            # fp64 through fp32 and rounds twice; match that.
+            return f"{x}.to(tl.float32).to({out_dtype})"
+
+        if (
             src_dtype is not None
             and dtype in fp8_dtypes
             and (src_dtype == torch.bool or is_integer_dtype(src_dtype))
