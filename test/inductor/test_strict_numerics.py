@@ -890,7 +890,6 @@ BACKWARD_XFAIL = frozenset(
         ("rsqrt", "float16"),
         ("sigmoid", "bfloat16"),
         ("sigmoid", "float16"),
-        ("sigmoid", "float32"),
         ("special_bessel_j0", "float32"),
         ("special_bessel_j1", "float32"),
         ("special_bessel_y0", "float32"),

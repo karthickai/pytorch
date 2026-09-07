@@ -27,6 +27,7 @@ from torch._decomp.decompositions import (
     logit_backward as decomp_logit_backward,
     pw_cast_for_opmath,
     pw_cast_for_opmath_non_tensor_args,
+    sigmoid_backward as decomp_sigmoid_backward,
 )
 from torch._decomp.decompositions_for_rng import extra_random_decomps
 from torch._dynamo.utils import counters
@@ -157,6 +158,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
     aten.hardswish_backward,  # inductor re-registers with strict true-division
     aten.logit_backward,  # inductor re-registers with strict NaN arms
+    aten.sigmoid_backward,  # inductor re-registers with strict association
 ]
 
 remove_decompositions(decompositions, decomps_to_exclude)
@@ -588,6 +590,19 @@ def logit_backward(
     if orig_dtype in (torch.float16, torch.bfloat16):
         out = out.to(orig_dtype)
     return out
+
+
+@register_decomposition([aten.sigmoid_backward])
+def sigmoid_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    if config.numerics != "strict" or output.is_complex():
+        return decomp_sigmoid_backward(grad_output, output)
+    # Eager (BinaryMiscBackwardOpsKernels.cu) computes grad * (1 - y) * y
+    # left-associated in the input dtype, while the base decomposition
+    # computes y * (1 - y) first. Re-associate; skipping pw_cast_for_opmath
+    # matches eager's narrow kernel, which never widens to fp32.
+    # (Complex keeps the base formula: eager conjugates the inner product,
+    # which the base spelling already matches.)
+    return (grad_output * (1 - output)) * output
 
 
 @register_decomposition([aten.bmm])
