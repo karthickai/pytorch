@@ -2707,6 +2707,24 @@ class TritonKernelOverrides(TritonOverrides):
             return cast(OpsValue, OpDecompositions._aten_i1_fp32(x)).value
         return cast(Any, TritonOverrides).i1(x)
 
+    # modified_bessel_i0_forward is expression-for-expression identical to the
+    # i0 jiterator string, so it reuses the i0 decomposition unchanged.
+    @staticmethod
+    def modified_bessel_i0(x):
+        if TritonKernelOverrides._use_aten_fp32_special(x):
+            from torch._inductor.codegen.common import OpDecompositions
+
+            return cast(OpsValue, OpDecompositions._aten_i0_fp32(x)).value
+        return cast(Any, TritonOverrides).modified_bessel_i0(x)
+
+    @staticmethod
+    def modified_bessel_i1(x):
+        if TritonKernelOverrides._use_aten_fp32_special(x):
+            from torch._inductor.codegen.common import OpDecompositions
+
+            return cast(OpsValue, OpDecompositions._i1(x, modified_bessel=True)).value
+        return cast(Any, TritonOverrides).modified_bessel_i1(x)
+
     @staticmethod
     def erfcx(x):
         if TritonKernelOverrides._use_aten_fp32_special(x):

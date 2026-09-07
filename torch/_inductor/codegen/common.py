@@ -1122,9 +1122,25 @@ class OpDecompositions:
 
     @staticmethod
     def _aten_i1_fp32(x: OpVarT) -> OpVarT:
-        r"""_aten_i1_fp32(x) -> OpsValue
+        return OpDecompositions._i1(x, modified_bessel=False)
 
-        Evaluate I1 using ATen's float32 Chebyshev recurrences.
+    # `special_i1` and `special_modified_bessel_i1` are the same Cephes series over the
+    # same coefficients, but the two eager kernels in
+    # aten/src/ATen/native/cuda/Math.cuh differ in two fp32-visible ways:
+    #  * small branch factor order - i1_string computes (exp(|x|) * |x|) * chbevl,
+    #    modified_bessel_i1_forward computes (chbevl * |x|) * exp(|x|);
+    #  * at -inf, i1_string's `(_x < 0) ? -out : out` negates the inf/inf NaN and
+    #    yields -NaN, while modified_bessel_i1_forward yields +NaN at both infinities.
+    #
+    # NOTE: these are the double-derived tables the jiterator strings use in float.
+    # The non-jiterator fallback calc_i1<float> (aten/src/ATen/native/Math.h) uses
+    # shorter float-specialized tables, so this only matches eager while
+    # AT_USE_JITERATOR() is on.
+    @staticmethod
+    def _i1(x: OpVarT, modified_bessel: bool) -> OpVarT:
+        r"""_i1(x, modified_bessel) -> OpsValue
+
+        Evaluate I1 with the selected ATen float32 recurrence ordering.
         """
         a = (
             2.77791411276104639959e-18,
@@ -1187,10 +1203,11 @@ class OpDecompositions:
         abs_x = ops.abs(x)
         two = ops.constant(2.0, torch.float32)
         small_z = ops.sub(ops.truediv(abs_x, two), two)
-        small = ops.mul(
-            ops.mul(ops.exp(abs_x), abs_x),
-            OpDecompositions._chbevl(small_z, a),
-        )
+        chbevl = OpDecompositions._chbevl(small_z, a)
+        if modified_bessel:
+            small = ops.mul(ops.mul(chbevl, abs_x), ops.exp(abs_x))
+        else:
+            small = ops.mul(ops.mul(ops.exp(abs_x), abs_x), chbevl)
         large_z = ops.sub(ops.truediv(ops.constant(32.0, torch.float32), abs_x), two)
         large = ops.truediv(
             ops.mul(ops.exp(abs_x), OpDecompositions._chbevl(large_z, b)),
@@ -1204,7 +1221,8 @@ class OpDecompositions:
             ops.neg(magnitude),
             magnitude,
         )
-        infinity = ops.copysign(ops.sub(x, x), x)
+        nan = ops.sub(x, x)
+        infinity = nan if modified_bessel else ops.copysign(nan, x)
         return ops.where(ops.isinf(abs_x), infinity, result)
 
     @staticmethod
