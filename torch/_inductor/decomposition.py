@@ -21,13 +21,16 @@ from torch._decomp.decompositions import (
     _grid_sampler_2d as decomp_grid_sampler_2d,
     _index_add,
     embedding_dense_backward as decomp_embedding_dense_backward,
+    gelu_backward as decomp_gelu_backward,
     hardsigmoid as decomp_hardsigmoid,
     hardswish as decomp_hardswish,
     hardswish_backward as decomp_hardswish_backward,
     logit_backward as decomp_logit_backward,
+    mish_backward as decomp_mish_backward,
     pw_cast_for_opmath,
     pw_cast_for_opmath_non_tensor_args,
     sigmoid_backward as decomp_sigmoid_backward,
+    silu_backward as decomp_silu_backward,
     tanh_backward as decomp_tanh_backward,
 )
 from torch._decomp.decompositions_for_rng import extra_random_decomps
@@ -160,8 +163,11 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardswish,  # inductor re-registers with strict reciprocal pin
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
     aten.hardswish_backward,  # inductor re-registers with strict true-division
+    aten.gelu_backward,  # inductor re-registers with strict FMA
     aten.logit_backward,  # inductor re-registers with strict NaN arms
+    aten.mish_backward,  # inductor re-registers with strict FMA
     aten.sigmoid_backward,  # inductor re-registers with strict association
+    aten.silu_backward,  # inductor re-registers with strict FMA
     aten.tanh_backward,  # inductor re-registers with strict FMA
 ]
 
@@ -636,15 +642,83 @@ def sigmoid_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.T
 def tanh_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
     if config.numerics != "strict" or output.is_complex():
         return decomp_tanh_backward(grad_output, output)
-    # Eager (BinaryMiscBackwardOpsKernels.cu) computes grad * (1 - y*y), and
-    # nvcc contracts the 1 - y*y into a single-rounding FMA; strict sets
-    # enable_fp_fusion to False so Triton would round the mul and sub
-    # separately. Spell it via addcmul with value=1 (fma(-y, y, 1)), whose
-    # lowering emits a raw tl.fma; value != 1 would take the mul_rn path
-    # and double-round, which exact rational analysis shows eager is not.
+    # Eager (BinaryMiscBackwardOpsKernels.cu) computes grad * (1 - y*y) in
+    # scalar_t. At fp16/bf16 that is c10::Half/BFloat16 arithmetic, whose
+    # operators round back to the narrow type after every step, so y*y is
+    # already rounded before the subtract and there is no contraction to
+    # match; the strict narrow lowering rounds the plain spelling the same way.
+    if output.dtype in (torch.float16, torch.bfloat16):
+        return grad_output * (1 - output * output)
+    # At fp32/fp64 the expression is native float arithmetic and nvcc contracts
+    # 1 - y*y into a single-rounding FMA; strict sets enable_fp_fusion to False
+    # so Triton would round the mul and sub separately. Spell it via addcmul
+    # with value=1 (fma(-y, y, 1)), whose lowering emits a raw tl.fma; value !=
+    # 1 would take the mul_rn path and double-round, which exact rational
+    # analysis shows eager is not.
     # (Complex keeps the base formula, same conjugation reason as above.)
     one = torch.full((), 1, dtype=output.dtype, device=output.device)
     return grad_output * torch.addcmul(one, -output, output)
+
+
+@register_decomposition([aten.silu_backward])
+@pw_cast_for_opmath
+def silu_backward(grad_output: torch.Tensor, self: torch.Tensor) -> torch.Tensor:
+    if config.numerics != "strict":
+        return decomp_silu_backward(grad_output, self)
+    # Eager (ActivationSiluKernel.cu) computes dy * s * (1 + x * (1 - s)) in
+    # opmath_t, and nvcc contracts the x * (1 - s) into the add. Strict sets
+    # enable_fp_fusion to False, so spell that contraction with addcmul
+    # value=1, whose lowering emits a raw tl.fma. The rest of the association
+    # already matches the base decomposition.
+    sigmoid = torch.sigmoid(self)
+    one = torch.full((), 1, dtype=self.dtype, device=self.device)
+    return grad_output * sigmoid * torch.addcmul(one, self, 1 - sigmoid)
+
+
+@register_decomposition([aten.mish_backward])
+@pw_cast_for_opmath
+def mish_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    if config.numerics != "strict":
+        return decomp_mish_backward(grad_output, input)
+    # Eager (ActivationMishKernel.cu) computes dy * (t + x * s * (1 - t*t)) in
+    # opmath_t, with two multiplies feeding adds that nvcc contracts: 1 - t*t
+    # and the outer t + (x*s) * (...). Strict sets enable_fp_fusion to False,
+    # so spell both with addcmul value=1, which lowers to raw tl.fma.
+    t = torch.tanh(torch.nn.functional.softplus(input))
+    s = torch.sigmoid(input)
+    one = torch.full((), 1, dtype=input.dtype, device=input.device)
+    return grad_output * torch.addcmul(t, input * s, torch.addcmul(one, -t, t))
+
+
+@register_decomposition([aten.gelu_backward])
+@pw_cast_for_opmath
+def gelu_backward(
+    grad: torch.Tensor, self: torch.Tensor, approximate: str = "none"
+) -> torch.Tensor:
+    if config.numerics != "strict" or approximate != "tanh":
+        return decomp_gelu_backward(grad, self, approximate)
+    # Eager (ActivationGeluKernel.cu) computes this in opmath_t, and nvcc
+    # contracts the three multiply-feeding-add sites that live inside a single
+    # statement: kKappa * x_cube into x, tanh_inner squared into 1, and
+    # 3 * kKappa * x_sq into 1. It does not contract the final
+    # left_derivative + right_derivative, which spans two statements. Strict
+    # sets enable_fp_fusion to False, so spell those three out.
+    M_SQRT2 = 1.41421356237309504880
+    M_2_SQRTPI = 1.12837916709551257390
+    kBeta = M_SQRT2 * M_2_SQRTPI * 0.5
+    kKappa = 0.044715
+    # nvcc folds opmath_t(3) * kKappa at the compute precision, so at fp32 the
+    # multiplier is float32(3 * float32(kKappa)) = 0.13414499163627625, one ulp
+    # below the double 3 * kKappa the base decomposition uses.
+    kKappa3 = 3 * kKappa if self.dtype == torch.float64 else 0.13414499163627625
+    x_sq = self * self
+    tanh_inner = torch.tanh(kBeta * torch.add(self, x_sq * self, alpha=kKappa))
+    one = torch.full((), 1, dtype=self.dtype, device=self.device)
+    left_derivative = 0.5 * (1 + tanh_inner)
+    tanh_derivative = torch.addcmul(one, -tanh_inner, tanh_inner)
+    inner_derivative = kBeta * torch.add(one, x_sq, alpha=kKappa3)
+    right_derivative = (0.5 * self) * tanh_derivative * inner_derivative
+    return grad * (left_derivative + right_derivative)
 
 
 @register_decomposition([aten.bmm])
