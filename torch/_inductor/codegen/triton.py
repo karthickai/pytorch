@@ -1665,6 +1665,35 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     # pyrefly: ignore [bad-override]
+    def fmax(a, b):
+        if config.numerics == "strict" and getattr(a, "dtype", None) in _STRICT_FLOAT:
+            # Eager fmax (CUDA ::fmax) ignores a NaN operand and returns the
+            # other one, and returns the canonical NaN when both are NaN. The
+            # plain tl.maximum already matches eager for non-NaN inputs
+            # (including the +0.0 signed-zero tie); only the NaN arms need
+            # explicit selects so input payloads never leak into the result.
+            return (
+                f"tl.where({a} != {a}, tl.where({b} != {b}, "
+                f"tl.maximum({a}, {b}, tl.PropagateNan.ALL), {b}), "
+                f"tl.where({b} != {b}, {a}, tl.maximum({a}, {b})))"
+            )
+        return f"tl.maximum({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def fmin(a, b):
+        if config.numerics == "strict" and getattr(a, "dtype", None) in _STRICT_FLOAT:
+            # See fmax: match eager fmin (::fmin), which returns -0.0 on
+            # signed-zero ties and the canonical NaN when both are NaN.
+            return (
+                f"tl.where({a} != {a}, tl.where({b} != {b}, "
+                f"tl.minimum({a}, {b}, tl.PropagateNan.ALL), {b}), "
+                f"tl.where({b} != {b}, {a}, tl.minimum({a}, {b})))"
+            )
+        return f"tl.minimum({a}, {b})"
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
     def where(a, b, c):
         return f"tl.where({a}, {b}, {c})"
 

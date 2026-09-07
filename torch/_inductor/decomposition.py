@@ -1205,6 +1205,15 @@ def select_decomp_table() -> dict[Any, Callable[..., Any]]:
     ):
         result = result.copy()
         remove_decompositions(result, [aten.special_log_ndtr])
+    if config.numerics == "strict" and torch.version.cuda is not None:
+        # fmax/fmin decompose to where/isnan comparisons that neither preserve
+        # eager's both-NaN canonical payload nor break +0.0/-0.0 ties correctly.
+        # Skipping the decomposition routes them to the pointwise lowering and
+        # the fmax/fmin overrides. Graph-wide like the gate above: it also
+        # covers non-CUDA devices on CUDA builds (the C++ override matches eager
+        # CPU there), while non-CUDA builds keep the old decomposition.
+        result = result.copy()
+        remove_decompositions(result, [aten.fmax, aten.fmin, prims.fmax, prims.fmin])
     return result
 
 
