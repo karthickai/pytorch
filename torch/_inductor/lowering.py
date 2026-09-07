@@ -9210,7 +9210,6 @@ register_pointwise_numeric(aten.asinh)
 register_pointwise_numeric(aten.atan2)
 register_pointwise_numeric(aten.atan)
 register_pointwise_numeric(aten.atanh)
-register_pointwise_numeric(aten.copysign)
 register_pointwise_numeric(aten.erfc)
 register_pointwise_numeric(aten.erfinv)
 register_pointwise_numeric(aten.hypot)
@@ -9300,6 +9299,47 @@ def nextafter(a, b):
 
 
 register_lowering(prims.nextafter, type_promotion_kind=None)(nextafter)
+
+
+def _strict_copysign_lowp(x, y, *, dtype):
+    # Port of copysign_half / copysign_bf16 (CopysignKernel.cu), the dedicated
+    # 16-bit path eager CUDA takes instead of c10::cuda::compat::copysign: it
+    # splices b's sign bit onto a's magnitude bits without ever leaving 16 bits.
+    # libdevice.copysign is faithful, but it runs on the fp32-widened operands
+    # and the narrowing store canonicalizes any NaN to +0x7FFF, which discards
+    # the very sign bit copysign was asked to install.
+    int_dtype = torch.int16
+    xi = ops.to_dtype_bitcast(x, int_dtype, src_dtype=dtype)
+    yi = ops.to_dtype_bitcast(y, int_dtype, src_dtype=dtype)
+    bits = ops.bitwise_or(
+        ops.bitwise_and(xi, ops.constant(0x7FFF, int_dtype)),
+        ops.bitwise_and(yi, ops.constant(-0x8000, int_dtype)),
+    )
+    return ops.to_dtype_bitcast(bits, dtype, src_dtype=int_dtype)
+
+
+# Spelled out for the same reason as nextafter above: ops.copysign only ever sees
+# the fp32-widened operands, so the 16-bit storage width has to be captured here.
+register_op_dtype_propagation_rules(
+    "copysign",
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+    override_return_dtype=None,
+)
+register_pointwise_op("copysign")
+
+
+@register_lowering(
+    aten.copysign,
+    broadcast=True,
+    type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT,
+)
+def copysign(a, b):
+    # The scalar-only overloads (copysign.float and friends) carry no box.
+    dtype = a.get_dtype() if isinstance(a, (TensorBox, ExpandView)) else None
+    if config.numerics == "strict" and dtype in (torch.float16, torch.bfloat16):
+        inner = functools.partial(_strict_copysign_lowp, dtype=dtype)
+        return make_pointwise(inner)(a, b)
+    return make_pointwise(ops_wrapper("copysign"))(a, b)
 
 
 from .codegen.common import BackendFeature, pointwise_overrides_data

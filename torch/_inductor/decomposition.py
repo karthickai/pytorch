@@ -43,6 +43,7 @@ from torch._prims_common import (
 )
 from torch._refs import native_layer_norm as decomp_native_layer_norm
 from torch._refs.nn.functional import _aten_hardtanh as _refs_aten_hardtanh
+from torch._refs.special import entr as decomp_entr
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
@@ -154,6 +155,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten._foreach_addcdiv_,
     aten.lerp,
     aten.lerp_,
+    aten.special_entr,  # inductor re-registers with strict NaN canonicalization
     aten.special_log_ndtr,  # inductor re-registers with copysign wrapper (#187336)
     aten.hardswish,  # inductor re-registers with strict reciprocal pin
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
@@ -189,6 +191,26 @@ def special_log_ndtr(a: torch.Tensor) -> torch.Tensor:
         torch.log1p(-torch.erfc(t) / 2),
     )
     return torch.copysign(res, -1.0)
+
+
+@register_decomposition([aten.special_entr])
+def special_entr(a: torch.Tensor) -> torch.Tensor:
+    res = decomp_entr(a)
+    if (
+        config.numerics != "strict"
+        or a.device.type != "cuda"
+        or a.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return res
+    # Eager jiterates entr at opmath width (jit_utils.cpp instantiates the
+    # functor with toOpMathType(scalar_t)), so `if (a != a) return a` hands
+    # back the fp32 widening of the input and the narrowing store collapses
+    # it to the canonical +0x7FFF. The decomposition picks the same arm but
+    # LLVM folds its fptrunc(fpext a) back to a, so it keeps the payload and
+    # sign that eager discards. Derive the all-set NaN from the input bits so
+    # no NaN constant can fold.
+    eager_nan = ((a.view(torch.int16) | -1) & 0x7FFF).view(a.dtype)
+    return torch.where(torch.isnan(a), eager_nan, res)
 
 
 if torch.distributed.is_available():
