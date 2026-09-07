@@ -28,6 +28,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .. import config, ir, pattern_matcher  # noqa: F401
 from ..codegen.common import custom_backend_passes
+from ..decomposition import _cuda_trailing_sum
 from ..fx_utils import FakeTensorUpdater, get_fake_args_kwargs, get_node_storage
 from ..lowering import lowerings as L
 from ..pattern_matcher import (
@@ -1091,6 +1092,73 @@ def pointless_cumsum_replacement(match: Match, shape, fill_value, device, dtype,
     match.nodes = [match.output_node()]
     # pyrefly: ignore [bad-argument-type]
     match.replace_by_example(repl, list(shape))
+
+
+# _cuda_trailing_sum only models ATen's layout while the reduction stays one warp deep;
+# past 128 elements setReduceConfig vectorises the input and the lane walk changes. This
+# bound is well inside that, keeps the unroll small, and is where the fold was measured
+# bit-exact (p=1..16 match, p=17+ do not, which is why they are declined here).
+_EAGER_FOLD_MAX_TRAILING = 16
+
+
+def eager_digamma_sum_check(match: Match) -> bool:
+    """Is this the trailing sum in mvlgamma's backward?
+
+    mvlgamma's derivative is spelled in FunctionsManual.cpp, not in an aten op, so
+    autograd inlines `grad * args.digamma_().sum(-1)` into the backward graph and there
+    is no `mvlgamma_backward` for the decomposition layer to re-register. The `digamma`
+    producer is what identifies the sum; everything else here is the regime in which
+    ATen's fold order is the simple one.
+    """
+    if config.numerics != "strict":
+        return False
+    if match.output_node().kwargs.get("dtype") is not None:
+        return False
+    x = match.kwargs["x"]
+    if not isinstance(x, torch.fx.Node) or x.target is not aten.digamma.default:
+        return False
+    val = x.meta.get("val")
+    if not isinstance(val, torch.Tensor) or not val.is_cuda:
+        return False
+    if torch.version.hip is not None or val.ndim == 0:
+        return False
+    dim = match.kwargs["dim"]
+    if not isinstance(dim, (list, tuple)) or list(dim) not in ([-1], [val.ndim - 1]):
+        return False
+    extent, stride = val.shape[-1], val.stride(-1)
+    if not isinstance(extent, int) or not isinstance(stride, int) or stride != 1:
+        return False
+    return 2 <= extent <= _EAGER_FOLD_MAX_TRAILING
+
+
+@register_graph_pattern(
+    CallFunction(
+        aten.sum.dim_IntList, KeywordArg("x"), KeywordArg("dim"), _users=MULTIPLE
+    ),
+    extra_check=eager_digamma_sum_check,
+    # pyrefly: ignore [bad-argument-type]
+    pass_dict=pass_patterns[1],
+)
+def eager_digamma_sum(match: Match, x, dim):
+    """Fold mvlgamma's backward sum in ATen's lane order instead of tl.sum's.
+
+    gpu_reduce_kernel walks a short contiguous trailing dim as lanes t, t+width, ...,
+    which pairs (t0+t2)+t1 for p=3, where tl.sum's INNER_TREE ordering pairs adjacent
+    elements. Both are the same algebra and a different fp32 result. Unrolling drops
+    the reduction, so the choice of ordering never arises.
+    """
+    val = x.meta["val"]
+    extent = val.shape[-1]
+    # Eager reduces in acc_type and rounds once on store; without the widen a 16-bit
+    # fold would round after every add.
+    acc = torch.float32 if val.dtype in (torch.float16, torch.bfloat16) else val.dtype
+
+    def repl(t):
+        terms = [t.select(-1, i).to(acc) for i in range(extent)]
+        return _cuda_trailing_sum(terms).to(val.dtype)
+
+    match.nodes = [match.output_node()]
+    match.replace_by_example(repl, [x])
 
 
 _cat_1 = CallFunction(aten.cat, Arg(), 1, _users=2)
