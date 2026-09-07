@@ -58,6 +58,7 @@ from torch._refs.special import (
 )
 from torch._refs.nn.functional import (
     _aten_hardtanh as _refs_aten_hardtanh,
+    gelu as _refs_gelu,
     softplus as _refs_softplus,
 from torch._refs.special import entr as decomp_entr
 from torch._refs.special import multigammaln as _refs_multigammaln
@@ -177,6 +178,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardswish,  # inductor re-registers with strict reciprocal pin
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
     aten.hardswish_backward,  # inductor re-registers with strict true-division
+    aten.gelu,  # inductor re-registers with strict FMA
     aten.gelu_backward,  # inductor re-registers with strict FMA
     aten.logaddexp2,  # inductor re-registers with strict FMA
     aten.logit_backward,  # inductor re-registers with strict NaN arms
@@ -843,6 +845,28 @@ def mish_backward(grad_output: torch.Tensor, input: torch.Tensor) -> torch.Tenso
     s = torch.sigmoid(input)
     one = torch.full((), 1, dtype=input.dtype, device=input.device)
     return grad_output * torch.addcmul(t, input * s, torch.addcmul(one, -t, t))
+
+
+@register_decomposition([aten.gelu])
+@pw_cast_for_opmath
+def gelu(a: torch.Tensor, approximate: str = "none") -> torch.Tensor:
+    if config.numerics != "strict" or approximate != "tanh":
+        return _refs_gelu(a, approximate)
+    # Eager (ActivationGeluKernel.cu) computes kBeta * (x + kKappa * x_cube) in
+    # opmath_t, and nvcc contracts the kKappa multiply into the add; strict
+    # sets enable_fp_fusion to False, so spell it with add's alpha. That is the
+    # only contraction site in the forward -- the outer
+    # 0.5 * x * (1 + tanh(inner)) has no multiply feeding an add -- and unlike
+    # the backward there is no constant product for nvcc to fold at fp32.
+    # pw_cast_for_opmath restates the fp32 opmath upcast that the base ref gets
+    # from its DEFAULT type promotion; without it the strict body would run at
+    # scalar_t on narrow input, and the alpha constant would round to it.
+    M_SQRT2 = 1.41421356237309504880
+    M_2_SQRTPI = 1.12837916709551257390
+    kBeta = M_SQRT2 * M_2_SQRTPI * 0.5
+    kKappa = 0.044715
+    inner = kBeta * torch.add(a, a * a * a, alpha=kKappa)
+    return 0.5 * a * (1 + torch.tanh(inner))
 
 
 @register_decomposition([aten.gelu_backward])
