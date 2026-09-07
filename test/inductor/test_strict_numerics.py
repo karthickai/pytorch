@@ -796,7 +796,6 @@ POINTWISE_XFAIL = frozenset(
         ("neg", "float16"),
         ("neg", "float32"),
         ("nn_functional_gelu", "float32"),
-        ("nn_functional_softplus", "float32"),
         ("special_bessel_y0", "float32"),
         ("special_bessel_y1", "float32"),
     }
