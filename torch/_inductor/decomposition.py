@@ -48,6 +48,7 @@ from torch._prims_common.wrappers import out_wrapper
 from torch._refs import (
     native_layer_norm as decomp_native_layer_norm,
     xlogy as decomp_xlogy,
+    logaddexp2 as _refs_logaddexp2,
 )
 from torch._refs.nn.functional import _aten_hardtanh as _refs_aten_hardtanh
 from torch._refs.special import (
@@ -172,6 +173,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.hardsigmoid,  # inductor re-registers with strict reciprocal pin
     aten.hardswish_backward,  # inductor re-registers with strict true-division
     aten.gelu_backward,  # inductor re-registers with strict FMA
+    aten.logaddexp2,  # inductor re-registers with strict FMA
     aten.logit_backward,  # inductor re-registers with strict NaN arms
     aten.mish_backward,  # inductor re-registers with strict FMA
     aten.mvlgamma,  # inductor re-registers with strict reduction order
@@ -691,6 +693,24 @@ def hardswish_backward(grad_output: torch.Tensor, self: torch.Tensor) -> torch.T
             torch.where(self < 3, grad_output * ((self / three) + 0.5), grad_output),
         )
     return decomp_hardswish_backward(grad_output, self)
+
+
+@register_decomposition([aten.logaddexp2])
+def logaddexp2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    if config.numerics != "strict":
+        return _refs_logaddexp2(a, b)
+    # Eager (LogAddExpKernel.cu) returns m + log1p(exp2(-|a-b|)) * inv_log_2 and
+    # nvcc contracts the multiply into the add; strict sets enable_fp_fusion to
+    # False, so Triton would round the multiply and the add separately. Spell
+    # the contraction with add's alpha, which lowers to a raw tl.fma.
+    mask = a >= b
+    max_ = torch.where(mask, a, b)
+    min_ = torch.where(mask, b, a)
+    inf_mask = torch.logical_and(torch.isinf(a), a == b)
+    result = torch.add(
+        max_, torch.log1p(torch.exp2(min_ - max_)), alpha=1.0 / math.log(2)
+    )
+    return torch.where(inf_mask, a, result)
 
 
 @register_decomposition([aten.logit_backward])
