@@ -1338,6 +1338,15 @@ _STRICT_FLOAT_INT_TY = {
 }
 _STRICT_FLOAT = tuple(_STRICT_FLOAT_INT_TY)
 
+# Per float dtype: the Triton unsigned type a bit pattern is spelled in, and the torch
+# type those bits are read out of.
+_FLOAT_BITS_TY = {
+    torch.float16: ("tl.uint16", torch.int16),
+    torch.bfloat16: ("tl.uint16", torch.int16),
+    torch.float32: ("tl.uint32", torch.int32),
+    torch.float64: ("tl.uint64", torch.int64),
+}
+
 
 class TritonOverrides(OpOverrides):
     """Map element-wise ops to Triton e.g., ops.to_dtype(x,...) -> x.to(...)"""
@@ -1479,6 +1488,20 @@ class TritonOverrides(OpOverrides):
         type_ = torch._prims_common.dtype_to_type(dtype)
         triton_val = constant_repr(type_(value))
         triton_type = triton_compute_type(dtype)
+        compute_dtype = upcast_compute_type(dtype)
+
+        if (
+            config.numerics == "strict"
+            and isinstance(value, float)
+            and math.isnan(value)
+            and compute_dtype in _FLOAT_BITS_TY
+        ):
+            # constant_repr collapses every NaN to float("nan"), losing the payload
+            # and the sign; strict needs the exact bits the eager scalar carries.
+            uint_type, int_dtype = _FLOAT_BITS_TY[compute_dtype]
+            bits = torch.tensor(value, dtype=compute_dtype).view(int_dtype).item()
+            bits &= (1 << (compute_dtype.itemsize * 8)) - 1
+            return f"tl.full({shape}, 0x{bits:X}, {uint_type}).to({triton_type}, bitcast=True)"
 
         # Triton's scalar_constant() treats -0.0 as 0 (since -0.0 == 0 in Python),
         # Work around by encoding -0.0 as its IEEE 754 hex in uint and bitcasting.

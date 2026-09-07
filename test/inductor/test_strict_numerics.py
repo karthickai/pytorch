@@ -722,9 +722,6 @@ POINTWISE_XFAIL = frozenset(
 
 BACKWARD_XFAIL = frozenset(
     {
-        ("__rpow__", "bfloat16"),
-        ("__rpow__", "float16"),
-        ("__rpow__", "float32"),
         ("float_power", "float32"),
         ("mvlgamma_mvlgamma_p_1", "float32"),
         ("mvlgamma_mvlgamma_p_3", "float32"),
