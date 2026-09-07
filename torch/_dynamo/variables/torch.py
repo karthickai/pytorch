@@ -1831,7 +1831,19 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             *args: VariableTracker,
             **kwargs: VariableTracker,
         ) -> VariableTracker | None:
-            if len(args) == 3 and "value" in kwargs and len(kwargs) == 1:
+            from torch._inductor import config as inductor_config
+
+            # Under strict numerics keep aten.addcdiv, which this rewrite is not
+            # equivalent to: it happens above autograd, so the backward becomes
+            # the derivative of the decomposition instead of eager's derivative
+            # formula, and for complex operands the three ops fall back to three
+            # separately rounded ATen kernels instead of eager's one fused kernel.
+            if (
+                len(args) == 3
+                and "value" in kwargs
+                and len(kwargs) == 1
+                and inductor_config.numerics != "strict"
+            ):
                 # decompose addcdiv into constituent ops, prevents a graph break due to converting
                 # value to a scalar
                 result = TorchInGraphFunctionVariable(torch.div).call_function(

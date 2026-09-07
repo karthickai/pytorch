@@ -786,9 +786,6 @@ BACKWARD_OPS = [op for op in POINTWISE_OPS if op.supports_autograd]
 # (op_id, dtype_label) pairs that must still differ from eager.
 POINTWISE_XFAIL = frozenset(
     {
-        ("addcdiv", "bfloat16"),
-        ("addcdiv", "float16"),
-        ("addcdiv", "float32"),
         ("clamp", "bfloat16"),
         ("clamp", "float16"),
         ("clamp", "float32"),
@@ -819,9 +816,6 @@ BACKWARD_XFAIL = frozenset(
         ("__rpow__", "bfloat16"),
         ("__rpow__", "float16"),
         ("__rpow__", "float32"),
-        ("addcdiv", "bfloat16"),
-        ("addcdiv", "float16"),
-        ("addcdiv", "float32"),
         ("double", "bfloat16"),
         ("double", "float16"),
         ("float_power", "bfloat16"),
