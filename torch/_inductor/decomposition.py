@@ -37,6 +37,7 @@ from torch._decomp.decompositions import (
     tanh_backward as decomp_tanh_backward,
 )
 from torch._decomp.decompositions_for_rng import extra_random_decomps
+from torch._dispatch.python import no_python_dispatcher
 from torch._dynamo.utils import counters
 from torch._environment import is_fbcode
 from torch._higher_order_ops.out_dtype import out_dtype
@@ -58,6 +59,7 @@ from torch._refs.nn.functional import (
     _aten_hardtanh as decomp_hardtanh,
     gelu as decomp_gelu,
     softplus as decomp_softplus,
+    softshrink as decomp_softshrink,
 )
 from torch._refs.special import (
     multigammaln as decomp_multigammaln,
@@ -68,6 +70,7 @@ from torch.fx.experimental.symbolic_shapes import (
     statically_known_true,
     sym_eq,
 )
+from torch.overrides import TorchFunctionMode
 
 from . import config, inductor_prims
 from .utils import (
@@ -166,6 +169,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.sigmoid_backward.default,
     aten.silu_backward.default,
     aten.softplus.default,
+    aten.softshrink.default,
     aten.tanh_backward.default,
     aten.embedding_dense_backward,  # we fall back on xpu
     aten.native_layer_norm,  # we fall back on mtia
@@ -786,6 +790,77 @@ def sigmoid_backward(grad_output: torch.Tensor, output: torch.Tensor) -> torch.T
     delta = (1 - output).to(dtype)
     product = (grad_output * delta.float()).to(dtype)
     return (product.float() * output).to(dtype)
+
+
+def _use_strict_softshrink(a: torch.Tensor) -> bool:
+    return is_strict_cuda_triton(a.device) and a.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    )
+
+
+class StrictSoftshrinkMode(TorchFunctionMode):
+    def __torch_function__(
+        self,
+        func: Callable[..., Any],
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs = {} if kwargs is None else kwargs
+        if func in (
+            torch.nn.functional.softshrink,
+            aten.softshrink,
+            aten.softshrink.default,
+        ):
+            a = args[0] if args else kwargs.get("input", kwargs.get("self"))
+            if isinstance(a, torch.Tensor) and _use_strict_softshrink(a):
+                # Keep native Autograd's single gradient path and signed zeros.
+                with no_python_dispatcher():
+                    return func(*args, **kwargs)
+        return func(*args, **kwargs)
+
+
+@register_decomposition(aten.softshrink.default)
+def softshrink(a: torch.Tensor, lambd: float = 0.5) -> torch.Tensor:
+    if not _use_strict_softshrink(a):
+        return cast(torch.Tensor, decomp_softshrink(a, lambd))
+    torch._check(
+        0 <= lambd <= torch.finfo(a.dtype).max,
+        lambda: f"lambda must be in range [0, {torch.finfo(a.dtype).max}] for input dtype {a.dtype}, but found {lambd}",
+    )
+    threshold = (torch.ones((), dtype=torch.float32, device=a.device) * lambd).to(
+        a.dtype
+    )
+    result = torch.where(
+        a > threshold, a - threshold, torch.where(a < -threshold, a + threshold, 0.0)
+    )
+    return torch.where(torch.isnan(a), a, result)
+
+
+@register_decomposition(aten.softshrink_backward.default)
+def softshrink_backward(
+    grad_output: torch.Tensor, self: torch.Tensor, lambd: float
+) -> torch.Tensor:
+    if not _use_strict_softshrink(self):
+        return NotImplemented
+    dtype = torch.result_type(grad_output, self)
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return NotImplemented
+    magnitude = abs(lambd)
+    torch._check(
+        torch.sym_not(
+            (magnitude > torch.finfo(dtype).max) & (magnitude != float("inf"))
+        ),
+        lambda: f"value cannot be converted to type {dtype} without overflow",
+    )
+    grad_output = _cuda_tensor_iterator_cast(grad_output, dtype)
+    self = _cuda_tensor_iterator_cast(self, dtype)
+    threshold = (torch.ones((), dtype=torch.float32, device=self.device) * lambd).to(
+        dtype
+    )
+    return torch.where((self >= -threshold) & (self <= threshold), 0.0, grad_output)
 
 
 @register_decomposition([aten.full])

@@ -122,7 +122,7 @@ from .codegen.common import (
     patch_compile_options,
 )
 from .debug import DebugContext
-from .decomposition import select_decomp_table
+from .decomposition import select_decomp_table, StrictSoftshrinkMode
 from .exc import InductorError
 from .fx_passes.joint_graph import joint_graph_passes
 from .fx_passes.post_grad import (
@@ -3362,6 +3362,7 @@ def _compile_fx_main(
     with (
         _use_lazy_graph_module(dynamo_config.use_lazy_graph_module),
         enable_python_dispatcher(),
+        StrictSoftshrinkMode() if config.strict_pointwise else contextlib.nullcontext(),
         torch.fx.traceback.preserve_node_meta(
             config.effective_provenance_tracking_level() == 1
         ),
@@ -3791,6 +3792,7 @@ def autograd_cache_key(
         ),
         _use_lazy_graph_module(dynamo_config.use_lazy_graph_module),
         enable_python_dispatcher(),
+        StrictSoftshrinkMode() if config.strict_pointwise else contextlib.nullcontext(),
         torch.fx.traceback.preserve_node_meta(
             config.effective_provenance_tracking_level() == 1
         ),
